@@ -100,3 +100,15 @@ compile attention_online_f16_wmma_cf16 dinov3_attention_online_f16_wmma_cf16 att
   dinov3.attention_online_f16_wmma_cf16.scale=0.125 \
   dinov3.attention_online_f16_wmma_cf16.max_images=64 \
   dinov3.attention_online_f16_wmma_cf16.token_capacity=262144
+# f16 branch path: o and down write f16, residual+norm reads f16. The branch is
+# produced by a matmul and consumed exactly once, so f32 doubles its traffic.
+compile residual_layernorm_f16branch dinov3_residual_layernorm_f32_f16branch residual_layernorm_f16branch \
+  dinov3.residual_layernorm_f32_f16branch.hidden_size=384 \
+  dinov3.residual_layernorm_f32_f16branch.epsilon=1e-5
+compile residual_scale_f16branch dinov3_residual_scale_f32_f16branch residual_f16branch \
+  dinov3.residual_scale_f32_f16branch.hidden_size=384
+for kn in 384:384 1536:384; do
+  k="${kn%%:*}"; n="${kn##*:}"
+  compile matmul_bias_f16_wmma_af16_cf16 dinov3_matmul_bias_f16_wmma_af16_cf16 "wmma_af16_cf16_k${k}_n${n}" \
+    "dinov3.matmul_bias_f16_wmma_af16_cf16.k_size=$k" "dinov3.matmul_bias_f16_wmma_af16_cf16.n_size=$n"
+done

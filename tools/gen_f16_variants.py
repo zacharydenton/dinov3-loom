@@ -79,6 +79,35 @@ EDITS = {
         ],
         "// VARIANT: writes f16 straight into the output projection's activation.",
     ),
+    "residual_layernorm_f32.loom": (
+        "residual_layernorm_f16branch.loom", "dinov3_residual_layernorm_f32",
+        "dinov3.residual_layernorm_f32",
+        [
+            ("%branch_view = buffer.view %branch_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>",
+             "%branch_view = buffer.view %branch_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>"),
+            ("""  %branch0 = view.load %branch_view[%token, %channel0] : view<[%token_count]x[%hidden_size]xf32> -> f32""",
+             """  %branch0_half = view.load %branch_view[%token, %channel0] : view<[%token_count]x[%hidden_size]xf16> -> f16
+  %branch0 = scalar.extf %branch0_half : f16 to f32"""),
+            ("""  %branch1 = view.load %branch_view[%token, %channel1] : view<[%token_count]x[%hidden_size]xf32> -> f32""",
+             """  %branch1_half = view.load %branch_view[%token, %channel1] : view<[%token_count]x[%hidden_size]xf16> -> f16
+  %branch1 = scalar.extf %branch1_half : f16 to f32"""),
+        ],
+        "// VARIANT: the attention/MLP branch arrives f16. It is produced by a matmul "
+        "and consumed exactly once, here, so carrying it f32 doubles its traffic for nothing.",
+    ),
+    "residual_scale_f32.loom": (
+        "residual_scale_f16branch.loom", "dinov3_residual_scale_f32",
+        "dinov3.residual_scale_f32",
+        [
+            ("%branch_view = buffer.view %branch_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>",
+             "%branch_view = buffer.view %branch_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>"),
+            ("""      %branch_value = view.load %branch_view[%token, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32""",
+             """      %branch_half = view.load %branch_view[%token, %channel] : view<[%token_count]x[%hidden_size]xf16> -> f16
+      %branch_value = scalar.extf %branch_half : f16 to f32"""),
+        ],
+        "// VARIANT: f16 branch. Pairs with the cf16 o/down matmuls; the last layer "
+        "and the --no-fuse-norm path reach the residual add through here.",
+    ),
     "rope_2d_f32.loom": (
         "rope_2d_f16.loom", "dinov3_rope_2d_f32", "dinov3.rope_2d_f32",
         [
@@ -139,6 +168,8 @@ SUFFIX = {
     "flash_attention_f16_wmma.loom": "_cf16",
     "rope_2d_f32.loom": "_f16",
     "flash_attention_f16_wmma_cf16.loom": "_af16",
+    "residual_layernorm_f32.loom": "_f16branch",
+    "residual_scale_f32.loom": "_f16branch",
     "attention_online_f16_wmma.loom": "_cf16",
 }
 

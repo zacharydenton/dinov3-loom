@@ -147,6 +147,10 @@ int main(int argc, char **argv) {
     // The hrx-demos online-softmax shape: one wave32 per (16 queries, head),
     // K and V read straight from global as fragments. Needs f16 q/k/v.
     bool online_attn = true;
+    // The attention and MLP branches are produced by a matmul and consumed
+    // exactly once, by residual+norm. Carrying them f32 doubles their traffic
+    // for no precision that survives the residual add.
+    bool f16_branch = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -166,6 +170,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-fuse-swiglu") fuse_swiglu = false;
         else if (a == "--attn-tile") attn_tile = std::stoi(next());
         else if (a == "--no-online-attn") online_attn = false;
+        else if (a == "--f32-branch") f16_branch = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -202,7 +207,7 @@ int main(int argc, char **argv) {
     Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
-    Kernel attn_online;
+    Kernel attn_online, wmma_o16_cf16, wmma_down16_cf16, residual_norm16, residual16;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -235,6 +240,10 @@ int main(int argc, char **argv) {
     wmma_swiglu.load(kernels_dir, "wmma_swiglu_k384_n1536", "dinov3_matmul_swiglu_f16_wmma");
     flash16_af16.load(kernels_dir, "flash_attention_af16", "dinov3_flash_attention_f16_wmma_cf16_af16");
     attn_online.load(kernels_dir, "attention_online_cf16", "dinov3_attention_online_f16_wmma_cf16");
+    wmma_o16_cf16.load(kernels_dir, "wmma_af16_cf16_k384_n384", "dinov3_matmul_bias_f16_wmma_af16_cf16");
+    wmma_down16_cf16.load(kernels_dir, "wmma_af16_cf16_k1536_n384", "dinov3_matmul_bias_f16_wmma_af16_cf16");
+    residual_norm16.load(kernels_dir, "residual_layernorm_f16branch", "dinov3_residual_layernorm_f32_f16branch");
+    residual16.load(kernels_dir, "residual_f16branch", "dinov3_residual_scale_f32_f16branch");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -245,6 +254,7 @@ int main(int argc, char **argv) {
     const bool narrow_act = wmma && f16_act;
     // q/k/v carried as f16 through rope and attention as well.
     const bool narrow_qkv = narrow_act && f16_qkv;
+    const bool narrow_branch = narrow_act && f16_branch;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
     const bool fused_swiglu = narrow_act && fuse_swiglu;
@@ -301,7 +311,7 @@ int main(int argc, char **argv) {
         args.scalar_i32(rows);
         args.pointer(stream); args.pointer(branch); args.pointer(lambda);
         args.pointer(gamma); args.pointer(beta); args.pointer(dst);
-        launch(residual_norm.function, rows, 1, args);
+        launch(narrow_branch ? residual_norm16.function : residual_norm.function, rows, 1, args);
     };
 
     auto forward = [&]() {
@@ -359,7 +369,8 @@ int main(int argc, char **argv) {
                 }
             }
             { Stage stage("o matmul");
-              matmul((narrow_act && flash_attn) ? wmma_o16 : (wmma ? wmma_o : proj_kernel),
+              matmul(narrow_branch ? wmma_o16_cf16
+                                   : ((narrow_act && flash_attn) ? wmma_o16 : (wmma ? wmma_o : proj_kernel)),
                      rows, HIDDEN, attn, PW(p + "o_w"), W(p + "o_b"), proj,
                      wmma ? TILE : narrow_tile); }
             if (fused_norm) {
@@ -370,7 +381,7 @@ int main(int argc, char **argv) {
                     KernArgs args;
                     args.scalar_i32(rows);
                     args.pointer(x); args.pointer(proj); args.pointer(W(p + "ls1"));
-                    launch(residual.function, rows, 1, args);
+                    launch(narrow_branch ? residual16.function : residual.function, rows, 1, args);
                 }
                 { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h, narrow_act); }
             }
@@ -392,7 +403,8 @@ int main(int argc, char **argv) {
                 }
             }
             { Stage stage("down matmul");
-              matmul(narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel),
+              matmul(narrow_branch ? wmma_down16_cf16
+                                   : (narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel)),
                      rows, HIDDEN, act, PW(p + "down_w"), W(p + "down_b"), mlp,
                      wmma ? TILE : narrow_tile); }
             if (fused_norm && layer + 1 < LAYERS) {
@@ -406,7 +418,7 @@ int main(int argc, char **argv) {
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(x); args.pointer(mlp); args.pointer(W(p + "ls2"));
-                launch(residual.function, rows, 1, args);
+                launch(narrow_branch ? residual16.function : residual.function, rows, 1, args);
             }
         }
         // The final norm writes f32, so it stays unfused.
