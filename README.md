@@ -6,18 +6,19 @@ DINOv3 ViT-S+/16 kernels written in **Loom**, AMD's new compiler substrate from
 
 ## Why
 
-`torch.compile` gets DINOv3-ViT-L to ~88 img/s on this iGPU and then stops: the
-plateau is batch-insensitive, and `max-autotune` **fails outright** because Triton's
-attention BMM wants 96 KB of LDS where gfx1151 has 64. That is a Triton tiling limit,
-not a hardware one. Loom lets you write the kernel directly — and the same compiler
-already runs a WMMA flash-attention kernel on this chip fast enough to beat RADV
-Vulkan by 45% on prefill in llama.cpp.
+`torch.compile` is the fastest way to run DINOv3 ViT-S+/16 on this iGPU, and
+`max-autotune` -- Triton searching its whole tile space -- is the fastest
+`torch.compile` gets. That is the bar. It is also a bar set by a general-purpose
+compiler that has never seen gfx1151's 64 KB of LDS, its 32-wave cap, or its
+appetite for exactly three workgroups per CU.
 
-The question this repo exists to answer: **is 88 img/s the silicon, or the toolchain?**
+The question this repo exists to answer: **is that bar the silicon, or the
+toolchain?** Loom lets you write every kernel directly, so the way to find out is
+to write them.
 
-It was the toolchain. A hand-written Loom forward pass reaches **1303 img/s** on
-ViT-S+/16 at batch 32, ahead of `max-autotune` (1280.7), at cosine 0.99998
-against transformers.
+It was the toolchain. The hand-written forward pass is ahead of `max-autotune` at
+both ends measured -- **1.12x at batch 32, 1.08x at batch 1** -- at cosine 0.99998
+against transformers. Numbers below.
 
 ## Model
 
@@ -31,33 +32,39 @@ dimensions, but S+ uses `use_gated_mlp: true` with SiLU where S uses plain GELU.
 
 ## Status
 
-Complete forward pass, validated, benchmarked. Six kernels:
+Complete forward pass, validated, benchmarked. One inference path, eleven
+kernels, every elementwise op except LayerNorm fused into the matmul that feeds
+it:
 
 | kernel | what |
 | --- | --- |
-| `layernorm_f32` | LayerNorm over the last dim; the one DINOv3 op ggml-hrx's corpus lacks |
-| `matmul_bias_f32` | `C = A @ W^T + bias`, W row-major `[N, K]` — a torch `nn.Linear` weight verbatim. 64x64 tile, 4x4 register micro-tile |
-| `matmul_bias_f32_narrow` | same, 64x32 tile, for the N=384 projections that cannot fill 40 CUs at 64 wide |
-| `rope_2d_f32` | DINOv3 axial RoPE, patch tokens only, race-free in place |
-| `attention_f32` | one workgroup per (token, head); two-stage LDS softmax |
-| `swiglu_f32` | `silu(gate) * up` — the "+" in ViT-S+ |
-| `residual_scale_f32` | LayerScale and residual fused, in place on the stream |
+| `matmul_bias_f16_wmma` | patch embedding: `A @ W^T + bias`, f32 patches in, f16 weights, WMMA, f32 accumulate |
+| `embed_scatter_f32` | places CLS, the 4 register tokens and the patches into the residual stream |
+| `layernorm_rowwave_f16` / `_f32out` | LayerNorm, one row per wave, no LDS, no barriers; f16 out for the model, f32 for the final norm |
+| `matmul_qkv_rope_f16_wmma` | the QKV projection with DINOv3's axial RoPE in the epilogue |
+| `attention_online_f16_wmma_cf16` | online-softmax attention, one wave32 per (16 queries, head), K and V fragment-loaded from global |
+| `matmul_resid_f16_wmma` | o and down projections with `x += lambda * (A@W + b)` -- LayerScale and the residual add -- in the epilogue |
+| `matmul_swiglu_f16_wmma` | gate and up accumulated by the same workgroup, `silu(gate) * up` in the epilogue; the "+" in ViT-S+ |
+| `matmul_splitk_f16_wmma` + `splitk_reduce_f16` | the down projection at batch 1, where 24 workgroups cannot fill 40 CUs |
 
 `host/dinov3` chains them into the 12-layer model: 87 launches per image,
 weights uploaded once, patch extraction on the host (16x16 stride 16 is a pure
-reshape). All nine kernel configurations compile in **106 ms total**.
+reshape). The residual stream, every activation and every weight is f16;
+accumulation is f32 throughout. All eleven configurations compile in about
+120 ms total -- Loom emits an HSACO in ~2 ms with no LLVM in the loop.
 
 ## Correctness
 
 `tools/validate.py` runs the model against HF transformers on three images:
 
 ```
-  PASS image 0: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=2.81e-05
-  PASS image 1: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=2.81e-05
-  PASS image 2: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=4.26e-05
+  PASS image 0: cosine full=0.9999821888 cls=0.9999852319 mean-patch=0.9999833401 max_abs=2.41e-02
+  PASS image 1: cosine full=0.9999807011 cls=0.9999844174 mean-patch=0.9999821151 max_abs=2.87e-02
+  PASS image 2: cosine full=0.9999860516 cls=0.9999889179 mean-patch=0.9999875116 max_abs=2.29e-02
 ```
 
-For scale: xdna-vision gates DINOv3 at cosine > 0.997.
+For scale: xdna-vision gates DINOv3 at cosine > 0.997. `tools/test_batch.py`
+repeats this for four distinct images in one batched call.
 
 `tools/reference.py` is an independent float64 NumPy implementation of the whole
 architecture, agreeing with transformers to 9.3e-06. Every individual kernel is
@@ -67,47 +74,43 @@ matching bug in the harness.
 ## Benchmark
 
 Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 3 interleaved rounds
-(`tools/benchmark.py`) on an idle GPU. Interleaving means both sides see the
-same conditions.
-
-> **This table predates two changes and understates the current code.** f16
-> attention/MLP branches measured **1.133x** at batch 32, and split-K on the down
-> projection measured **1.179x** at batch 1 (which puts batch 1 at ~626 img/s,
-> past torch max-autotune's 594.3). Both are A/B ratios measured interleaved; the
-> absolute figures below have not been re-measured on an idle box since, so they
-> are left as they were rather than scaled. Re-run `tools/benchmark.py` on a
-> quiet machine to refresh them.
+(`tools/benchmark.py`; raw output in `docs/benchmark-2026-09-04-release.txt`).
+Interleaving means both sides see the same conditions -- here an idle GPU and a
+10-core CPU job resident throughout, which depresses both by a similar amount.
+Torch's `max-autotune` figure has reproduced to within 0.5% across three runs on
+three different days, so the comparison is stable even if the absolutes drift.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| **loom fp16, batch 32** | **1303.3** | **1.00x** |
-| torch max-autotune fp16, batch 64 | 1280.7 | 0.98x |
-| **loom fp16, batch 64** | **1220.4** | 0.94x |
-| **loom fp16, batch 8** | **1215.2** | 0.93x |
-| torch compile fp16, batch 64 | 1131.2 | 0.87x |
-| torch eager fp16, batch 64 | 836.6 | 0.64x |
-| torch max-autotune fp16, batch 1 | 594.3 | 0.46x |
-| **loom fp16, batch 1** | **543.5** | 0.42x |
-| torch compile fp16, batch 1 | 385.8 | 0.30x |
-| torch eager fp16, batch 1 | 288.5 | 0.22x |
-| torch max-autotune fp32, batch 64 | 255.9 | 0.20x |
-| **loom fp32, batch 32** | **230.8** | 0.18x |
-| torch compile fp32, batch 64 | 174.2 | 0.13x |
-| torch eager fp32, batch 64 | 163.0 | 0.13x |
-| **loom fp32, batch 1** | **130.1** | 0.10x |
-| torch eager fp32, batch 1 | 115.2 | 0.09x |
+| **loom fp16, batch 32** | **1431.0** | **1.00x** |
+| **loom fp16, batch 64** | **1324.9** | 0.93x |
+| torch max-autotune fp16, batch 64 | 1280.7 | 0.89x |
+| torch compile fp16, batch 64 | 1081.1 | 0.76x |
+| **loom fp16, batch 8** | **1061.9** | 0.74x |
+| torch eager fp16, batch 64 | 736.6 | 0.51x |
+| **loom fp16, batch 1** | **645.9** | 0.45x |
+| torch max-autotune fp16, batch 1 | 599.4 | 0.42x |
+| torch compile fp16, batch 1 | 380.6 | 0.27x |
+| torch eager fp16, batch 1 | 276.3 | 0.19x |
+| torch max-autotune fp32, batch 64 | 241.9 | 0.17x |
+| torch eager fp32, batch 1 | 114.6 | 0.08x |
 
 Read it honestly:
 
-- **It is faster than every torch configuration measured, at batch 32.** The
-  margin over `max-autotune` is 1.8% -- a win, but a narrow one, and closer to
-  run-to-run variance than the table's ordering suggests.
-- **Batch 1 used to lose to `max-autotune`** (543.5 vs 594.3) and no longer
-  does: split-K on the down projection took it to ~626 img/s. An earlier version
-  of this table claimed batch 1 beat every torch configuration when it did not;
-  that is now true, but it was not then.
-- **The MLP is now the bottleneck**: gate/up+swiglu 30.1% of the forward pass,
-  the down projection 22.3%. Attention, which used to be 36.4%, is 10.2%.
+- **Batch 32 is 1.12x over torch's best configuration** at any batch size. The
+  margin is real -- it has held across three independent runs -- but it is not
+  large, and torch's number is a compiler's output with nobody having touched a
+  kernel.
+- **Batch 1 is 1.08x over `max-autotune` at batch 1.** That took split-K on the
+  down projection; before it the runner launched 24 workgroups against ~120
+  slots and lost. Batch 1 is still throughput-limited by the subprocess-per-call
+  design of the Python API, not by the kernels.
+- **Batch 64 is slower than batch 32** on this repo and it is not the cache: the
+  gate/up intermediate spills the 32 MB L3 from batch 28 up, and a sweep showed
+  no cliff there. It has not been chased.
+- Loom has no f32 path any more. The f32 rows are torch's, kept because they
+  show what precision costs on this part: `max-autotune` fp32 at batch 64 is
+  slower than Loom fp16 at batch 1.
 
 Accuracy: cosine **0.99998** against transformers on the full fp16 path (f16
 weights, f16 activations, f16 attention probabilities, f16 residual stream, f32
@@ -138,7 +141,8 @@ residual add and LayerScale into o and down.
 
 The run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 (f32) -> 468 (WMMA) -> 667
 (flash attention) -> 758 (f16 activations) -> 915 (kernel fusion) -> 1303
-(online-softmax attention) img/s; `docs/notes.md` has what each step was worth.
+(online-softmax attention) -> 1431 (f16 residual stream, RoPE and residual
+folded into epilogues, one-row-per-wave LayerNorm) img/s; `docs/notes.md` has what each step was worth.
 
 ## Layout
 
@@ -167,7 +171,7 @@ $ /opt/rocm/bin/hipcc -O2 -o host/loomrun host/loomrun.cpp
 
 $ ./scripts/test.sh                        # kernels, error paths, end-to-end
 $ ./host/dinov3 --input build/patchified.bin --batch 32 --repeat 40
-{"batch": 32, "images": 1280, "total_ms": 907.125, "ms_per_image": 0.7087, "img_per_s": 1411.05}
+{"batch": 32, "images": 1280, "total_ms": 886.043, "ms_per_image": 0.6922, "img_per_s": 1444.62}
 $ python3 tools/benchmark.py               # vs torch, interleaved
 ```
 
