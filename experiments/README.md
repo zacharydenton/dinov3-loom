@@ -44,3 +44,10 @@ $ ./experiments/rocwmma_gemm 4 -v     # batch, verbose
 Note the corpus stages its fragments through padded LDS views (`view<64x40xf16>`,
 not 64x32) — the same bank-conflict avoidance that was worth 10x in the f32
 matmul and 4x in attention.
+
+## matmul_bias_f16_wmma_m128n64.loom
+
+hrx-demos' 2-wave 128x64 no-LDS tile. Correct, and 0.34x-1.18x depending on
+shape -- a loss on everything but `o`. 200 VGPRs against the staged kernel's 64,
+so 7 waves/SIMD against 16, with no LDS prefetch to hide global latency. See
+docs/notes.md "Lever 6".

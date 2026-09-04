@@ -478,3 +478,55 @@ was measured with.
 
 The bottleneck is now the MLP: gate/up+swiglu at 30.1% and the down projection at
 22.3%.
+
+## Lever 6: the no-LDS m128n64 matmul -- measured, rejected
+
+`experiments/matmul_bias_f16_wmma_m128n64.loom` is a port of
+`hrx-demos/kernels/ideogram4/linear_bf16_bf16_wmma_m128n64_2wave.loom`: two
+wave32s, each owning a 64x64 output tile as sixteen 16x16 accumulators, so one
+k-step is four `lhs` + four `rhs` global fragment loads feeding sixteen
+`vector.mma`. A 4:1 compute-to-load ratio against the staged kernel's 1:1, zero
+LDS in the loop, zero barriers. With the `index.assume` rule from Lever 5 it
+compiled first try; only the LDS staging view needed fixing (fragment memory ops
+want a 2-D view, so each wave takes its own by `index.scale` offset).
+
+Measured on an idle GPU, batch 32 shapes, against `matmul_bias_f16_wmma_af16`:
+
+| shape | m128n64 | TFLOP/s | af16 | TFLOP/s | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| o (k384 n384) | 98.73 us | 19.2 | 116.92 us | 16.2 | **1.18x** |
+| qkv (k384 n1152) | 331.41 us | 17.2 | 307.98 us | 18.5 | 0.93x |
+| gate/up (k384 n3072) | 1238.43 us | 12.3 | 1026.88 us | 14.8 | 0.83x |
+| down (k1536 n384) | 1222.24 us | 6.2 | 420.47 us | 18.0 | **0.34x** |
+| down, batch 8 | 191.96 us | 9.9 | 147.05 us | 12.9 | 0.77x |
+
+Correct everywhere (cosine 1.00000000), and slower everywhere that matters.
+
+The reason is in the kernel descriptor:
+
+```
+m128n64:  vgpr_count 200, group_segment 8704
+af16:     vgpr_count  64, group_segment 18432
+```
+
+Sixteen `vector<8xf32>` accumulators plus eight live fragments is 200 VGPRs.
+gfx1151 has 1536 VGPRs per SIMD in wave32, so that is **7 waves per SIMD against
+the 16-wave cap** -- 44% occupancy -- and because every operand now comes from
+global there is no LDS prefetch left to hide the latency with. The staged kernel
+spends more LDS (18432 B) precisely to stay at 64 VGPRs and full occupancy.
+
+The k=1536 case is worst because it has the most k-steps to stall on, and the
+fewest n-tiles (6) to spread the stalls across.
+
+**This is the third time the same law has decided a measurement in this repo**,
+after hand double-buffering and the 32-row attention tile: *on gfx1151 at these
+sizes, anything that trades occupancy for locality loses.* hrx-demos targets
+gfx1100 -- a discrete part with real GDDR bandwidth and different balance. Their
+kernel shapes are not portable to an APU on LPDDR5X, even though their *idioms*
+(global fragment loads, no `index.assume`) very much are: those were worth 4.4x
+on attention in Lever 5.
+
+The one shape that wins, `o`, is 5.4% of the forward pass, so 1.18x there is
+~0.8% overall -- inside run-to-run variance. Not wired in. The kernel is kept in
+`experiments/` because the *next* shape someone tries may have the arithmetic
+intensity to pay for the registers.

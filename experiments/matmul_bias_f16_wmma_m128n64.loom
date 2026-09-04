@@ -1,0 +1,249 @@
+// A 128x64 output tile across two wave32s, with NO LDS in the k-loop.
+//
+// Ported from hrx-demos `kernels/ideogram4/linear_bf16_bf16_wmma_m128n64_2wave.loom`.
+// Each wave owns a 64x64 tile as sixteen 16x16 accumulators; one k-step is four
+// `lhs` loads and four `rhs` loads feeding sixteen `vector.mma`, so the
+// compute-to-load ratio is 4:1 against the staged kernel's 1:1, and there is no
+// barrier anywhere in the loop. Both operands are fragment-loaded straight from
+// global; the weight transpose is a strided view, not a copy.
+//
+// Every index that reaches a fragment load is derived structurally and bounded
+// with index.rem. Do not add index.assume to any of them -- it makes the value
+// opaque to the fragment-memory planner and the load stops lowering. See
+// docs/notes.md "Lever 5".
+//
+// A is padded to token_capacity rows: a 128-row tile may overhang m_size and the
+// overhanging rows are read, then dropped at the store.
+
+amdgpu.target<gfx11-generic> @dinov3_matmul_m128n64_gfx11 {subgroup_size = 32}
+
+config.decl @dinov3.matmul_bias_f16_wmma_m128n64.k_size : %value: index where [range(%value, 16, 8192), mul(%value, 16)]
+
+config.decl @dinov3.matmul_bias_f16_wmma_m128n64.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.matmul_bias_f16_wmma_m128n64.token_capacity : %value: index where [range(%value, 128, 1048576), mul(%value, 128)]
+
+config.decl @dinov3.matmul_bias_f16_wmma_m128n64.max_m_tiles : %value: index where [range(%value, 1, 8192)]
+
+kernel.def target(@dinov3_matmul_m128n64_gfx11) export("dinov3_matmul_bias_f16_wmma_m128n64") @dinov3_matmul_bias_f16_wmma_m128n64(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %n_size0 = config.get @dinov3.matmul_bias_f16_wmma_m128n64.n_size : index
+  %m_rounded = index.add %m_size, %c127 : index
+  %m_tiles = index.div %m_rounded, %c128 : index
+  %n_tiles = index.div %n_size0, %c64 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles, %c1) workgroup_size(%c64, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer) {
+  %k_size = config.get @dinov3.matmul_bias_f16_wmma_m128n64.k_size : index
+  %n_size = config.get @dinov3.matmul_bias_f16_wmma_m128n64.n_size : index
+  %capacity = config.get @dinov3.matmul_bias_f16_wmma_m128n64.token_capacity : index
+  %max_m_tiles = config.get @dinov3.matmul_bias_f16_wmma_m128n64.max_m_tiles : index
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c0_offset = index.constant 0 : offset
+  %stage_bytes = index.constant 8704 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+  %zero_acc = vector.constant 0.0 : vector<8xf32>
+
+  %n_tile_raw = kernel.workgroup.id<x> : index
+  %m_tile_raw = kernel.workgroup.id<y> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  // index.rem is what the subrange analysis follows through a workgroup id; both
+  // of these are no-ops at runtime and exist only to bound the fragment loads.
+  %n_tile_limit = index.div %n_size, %c64 : index
+  %n_tile = index.rem %n_tile_raw, %n_tile_limit : index
+  %m_tile = index.rem %m_tile_raw, %max_m_tiles : index
+
+  %k_tile_count = index.div %k_size, %c16 : index
+  %base_m = index.mul %m_tile, %c128 : index
+  %base_n = index.mul %n_tile, %c64 : index
+  %wave_m = index.mul %subgroup, %c64 : index
+  %token_origin0 = index.add %base_m, %wave_m : index
+  %token_origin1 = index.add %token_origin0, %c16 : index
+  %token_origin2 = index.add %token_origin0, %c32 : index
+  %token_origin3 = index.add %token_origin0, %c48 : index
+  %row_origin0 = index.add %base_n, %c0 : index
+  %row_origin1 = index.add %base_n, %c16 : index
+  %row_origin2 = index.add %base_n, %c32 : index
+  %row_origin3 = index.add %base_n, %c48 : index
+
+  %weight_layout = encoding.layout.strided [1, %k_size] : encoding<layout>
+  %a_noalias, %w_noalias, %bias_noalias, %c_noalias = buffer.assume.noalias %a, %w, %bias, %c : buffer, buffer, buffer, buffer
+  %a_global = buffer.assume.memory_space<global> %a_noalias : buffer
+  %w_global = buffer.assume.memory_space<global> %w_noalias : buffer
+  %bias_global = buffer.assume.memory_space<global> %bias_noalias : buffer
+  %c_global = buffer.assume.memory_space<global> %c_noalias : buffer
+  %a_aligned = buffer.assume.alignment %a_global {minimum_alignment = 16} : buffer
+  %w_aligned = buffer.assume.alignment %w_global {minimum_alignment = 16} : buffer
+  %a_view = buffer.view %a_aligned[%c0_offset] : buffer -> view<[%capacity]x[%k_size]xf16>
+  %w_view = buffer.view %w_aligned[%c0_offset] : buffer -> view<[%k_size]x[%n_size]xf16, %weight_layout>
+  %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf32>
+
+  %wave_stage_bytes = index.constant 4352 : offset
+  %stage = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  // Fragment memory ops want a 2-D view, so each wave gets its own by offset
+  // rather than by a leading axis.
+  %wave_stage_offset = index.scale %subgroup, %wave_stage_bytes : index, offset -> offset
+  %stage_view = buffer.view %stage[%wave_stage_offset] : buffer -> view<16x68xf32>
+  %init00 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init01 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init02 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init03 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init10 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init11 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init12 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init13 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init20 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init21 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init22 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init23 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init30 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init31 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init32 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %init33 = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %result00, %result01, %result02, %result03, %result10, %result11, %result12, %result13, %result20, %result21, %result22, %result23, %result30, %result31, %result32, %result33 = scf.for %k_tile = [%c0 to %k_tile_count step %c1](%acc00 = %init00 : vector<8xf32>, %acc01 = %init01 : vector<8xf32>, %acc02 = %init02 : vector<8xf32>, %acc03 = %init03 : vector<8xf32>, %acc10 = %init10 : vector<8xf32>, %acc11 = %init11 : vector<8xf32>, %acc12 = %init12 : vector<8xf32>, %acc13 = %init13 : vector<8xf32>, %acc20 = %init20 : vector<8xf32>, %acc21 = %init21 : vector<8xf32>, %acc22 = %init22 : vector<8xf32>, %acc23 = %init23 : vector<8xf32>, %acc30 = %init30 : vector<8xf32>, %acc31 = %init31 : vector<8xf32>, %acc32 = %init32 : vector<8xf32>, %acc33 = %init33 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+    %k_origin = index.mul %k_tile, %c16 : index
+    %lhs0 = vector.fragment.load<lhs> %a_view[%token_origin0, %k_origin] shape [%m, %k] : view<[%capacity]x[%k_size]xf16> -> vector<16xf16>
+    %lhs1 = vector.fragment.load<lhs> %a_view[%token_origin1, %k_origin] shape [%m, %k] : view<[%capacity]x[%k_size]xf16> -> vector<16xf16>
+    %lhs2 = vector.fragment.load<lhs> %a_view[%token_origin2, %k_origin] shape [%m, %k] : view<[%capacity]x[%k_size]xf16> -> vector<16xf16>
+    %lhs3 = vector.fragment.load<lhs> %a_view[%token_origin3, %k_origin] shape [%m, %k] : view<[%capacity]x[%k_size]xf16> -> vector<16xf16>
+    %rhs0 = vector.fragment.load<rhs> %w_view[%k_origin, %row_origin0] shape [%k, %n] : view<[%k_size]x[%n_size]xf16, %weight_layout> -> vector<16xf16>
+    %rhs1 = vector.fragment.load<rhs> %w_view[%k_origin, %row_origin1] shape [%k, %n] : view<[%k_size]x[%n_size]xf16, %weight_layout> -> vector<16xf16>
+    %rhs2 = vector.fragment.load<rhs> %w_view[%k_origin, %row_origin2] shape [%k, %n] : view<[%k_size]x[%n_size]xf16, %weight_layout> -> vector<16xf16>
+    %rhs3 = vector.fragment.load<rhs> %w_view[%k_origin, %row_origin3] shape [%k, %n] : view<[%k_size]x[%n_size]xf16, %weight_layout> -> vector<16xf16>
+    %next00 = vector.mma %lhs0, %rhs0, %acc00 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next01 = vector.mma %lhs0, %rhs1, %acc01 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next02 = vector.mma %lhs0, %rhs2, %acc02 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next03 = vector.mma %lhs0, %rhs3, %acc03 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next10 = vector.mma %lhs1, %rhs0, %acc10 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next11 = vector.mma %lhs1, %rhs1, %acc11 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next12 = vector.mma %lhs1, %rhs2, %acc12 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next13 = vector.mma %lhs1, %rhs3, %acc13 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next20 = vector.mma %lhs2, %rhs0, %acc20 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next21 = vector.mma %lhs2, %rhs1, %acc21 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next22 = vector.mma %lhs2, %rhs2, %acc22 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next23 = vector.mma %lhs2, %rhs3, %acc23 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next30 = vector.mma %lhs3, %rhs0, %acc30 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next31 = vector.mma %lhs3, %rhs1, %acc31 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next32 = vector.mma %lhs3, %rhs2, %acc32 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next33 = vector.mma %lhs3, %rhs3, %acc33 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %next00, %next01, %next02, %next03, %next10, %next11, %next12, %next13, %next20, %next21, %next22, %next23, %next30, %next31, %next32, %next33 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  // Publish a 16x64 row-block at a time through 4352 bytes of LDS per wave: the
+  // fragment lane mapping is not addressable directly, and the bias add wants
+  // (row, column) coordinates. 16x64 is 256 vector4s over 32 lanes, eight each.
+  // The row stride is padded 64 -> 68 to keep the banks apart and every vector4
+  // 16-byte aligned.
+
+  vector.fragment.store<result> %result00, %stage_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result01, %stage_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result02, %stage_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result03, %stage_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %slot_base0 = index.mul %step, %c32 : index
+    %slot0 = index.add %slot_base0, %lane : index
+    %row0 = index.div %slot0, %c16 : index
+    %group0 = index.rem %slot0, %c16 : index
+    %col0 = index.mul %group0, %c4 : index
+    %values0 = vector.load %stage_view[%row0, %col0] : view<16x68xf32> -> vector<4xf32>
+    %out_col0 = index.add %base_n, %col0 : index
+    %bias0 = vector.load %bias_view[%out_col0] : view<[%n_size]xf32> -> vector<4xf32>
+    %biased0 = vector.addf %values0, %bias0 : vector<4xf32>
+    %out_row0 = index.add %token_origin0, %row0 : index
+    %writes0 = index.cmp ult, %out_row0, %m_size : index
+    scf.if %writes0 {
+      %bounded0 = index.assume %out_row0 [lt(%out_row0, %m_size)] : index
+      vector.store %biased0, %c_view[%bounded0, %out_col0] : vector<4xf32>, view<[%m_size]x[%n_size]xf32>
+    }
+  }
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+
+  vector.fragment.store<result> %result10, %stage_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result11, %stage_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result12, %stage_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result13, %stage_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %slot_base1 = index.mul %step, %c32 : index
+    %slot1 = index.add %slot_base1, %lane : index
+    %row1 = index.div %slot1, %c16 : index
+    %group1 = index.rem %slot1, %c16 : index
+    %col1 = index.mul %group1, %c4 : index
+    %values1 = vector.load %stage_view[%row1, %col1] : view<16x68xf32> -> vector<4xf32>
+    %out_col1 = index.add %base_n, %col1 : index
+    %bias1 = vector.load %bias_view[%out_col1] : view<[%n_size]xf32> -> vector<4xf32>
+    %biased1 = vector.addf %values1, %bias1 : vector<4xf32>
+    %out_row1 = index.add %token_origin1, %row1 : index
+    %writes1 = index.cmp ult, %out_row1, %m_size : index
+    scf.if %writes1 {
+      %bounded1 = index.assume %out_row1 [lt(%out_row1, %m_size)] : index
+      vector.store %biased1, %c_view[%bounded1, %out_col1] : vector<4xf32>, view<[%m_size]x[%n_size]xf32>
+    }
+  }
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+
+  vector.fragment.store<result> %result20, %stage_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result21, %stage_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result22, %stage_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result23, %stage_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %slot_base2 = index.mul %step, %c32 : index
+    %slot2 = index.add %slot_base2, %lane : index
+    %row2 = index.div %slot2, %c16 : index
+    %group2 = index.rem %slot2, %c16 : index
+    %col2 = index.mul %group2, %c4 : index
+    %values2 = vector.load %stage_view[%row2, %col2] : view<16x68xf32> -> vector<4xf32>
+    %out_col2 = index.add %base_n, %col2 : index
+    %bias2 = vector.load %bias_view[%out_col2] : view<[%n_size]xf32> -> vector<4xf32>
+    %biased2 = vector.addf %values2, %bias2 : vector<4xf32>
+    %out_row2 = index.add %token_origin2, %row2 : index
+    %writes2 = index.cmp ult, %out_row2, %m_size : index
+    scf.if %writes2 {
+      %bounded2 = index.assume %out_row2 [lt(%out_row2, %m_size)] : index
+      vector.store %biased2, %c_view[%bounded2, %out_col2] : vector<4xf32>, view<[%m_size]x[%n_size]xf32>
+    }
+  }
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+
+  vector.fragment.store<result> %result30, %stage_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result31, %stage_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result32, %stage_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  vector.fragment.store<result> %result33, %stage_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %slot_base3 = index.mul %step, %c32 : index
+    %slot3 = index.add %slot_base3, %lane : index
+    %row3 = index.div %slot3, %c16 : index
+    %group3 = index.rem %slot3, %c16 : index
+    %col3 = index.mul %group3, %c4 : index
+    %values3 = vector.load %stage_view[%row3, %col3] : view<16x68xf32> -> vector<4xf32>
+    %out_col3 = index.add %base_n, %col3 : index
+    %bias3 = vector.load %bias_view[%out_col3] : view<[%n_size]xf32> -> vector<4xf32>
+    %biased3 = vector.addf %values3, %bias3 : vector<4xf32>
+    %out_row3 = index.add %token_origin3, %row3 : index
+    %writes3 = index.cmp ult, %out_row3, %m_size : index
+    scf.if %writes3 {
+      %bounded3 = index.assume %out_row3 [lt(%out_row3, %m_size)] : index
+      vector.store %biased3, %c_view[%bounded3, %out_col3] : vector<4xf32>, view<[%m_size]x[%n_size]xf32>
+    }
+  }
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  kernel.return
+}
