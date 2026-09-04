@@ -28,6 +28,8 @@ compile attention_f32 dinov3_attention_f32 attention \
 compile embed_scatter_f32 dinov3_embed_scatter_f32 embed_scatter \
   dinov3.embed_scatter_f32.hidden_size=384 dinov3.embed_scatter_f32.tokens_per_image=201 \
   dinov3.embed_scatter_f32.prefix=5
+compile residual_layernorm_f32 dinov3_residual_layernorm_f32 residual_layernorm \
+  dinov3.residual_layernorm_f32.hidden_size=384 dinov3.residual_layernorm_f32.epsilon=1e-5
 compile layernorm_f32_to_f16 dinov3_layernorm_f32_f16 layernorm_f16 \
   dinov3.layernorm_f32_f16.hidden_size=384 dinov3.layernorm_f32_f16.epsilon=1e-5
 compile swiglu_f16 dinov3_swiglu_f32_f16 swiglu_f16 \

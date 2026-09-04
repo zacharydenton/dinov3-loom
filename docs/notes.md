@@ -262,3 +262,59 @@ from f16 activations came from the *read amplification* on the matmul A operand
 (48 column tiles for gate/up), and q/k/v have no such amplification -- attention
 reads them once per query tile, and rope reads them once. There was never much
 bandwidth there to save.
+
+## Lever 1: hand double-buffering the k-loop -- rejected
+
+Inductor's matmuls run with `num_stages=2`, so Triton software-pipelines the
+k-loop: the global load for block k+1 issues while block k is still in the MMA.
+The kernel here staged explicitly into LDS with two barriers per k-step and no
+overlap, which looked like the obvious gap.
+
+Implemented it: two LDS slabs each for A and W, a prologue staging block 0, and a
+loop body that issues block k+1's loads, does block k's MMA, then writes the
+prefetched values into the other slab -- one barrier per step instead of two.
+Correct (cosine unchanged) and kept in `experiments/` for reference.
+
+**It is slower.** Best of 3, alternating, idle GPU:
+
+| | double-buffered | single |
+| --- | ---: | ---: |
+| batch 8 | 766.6 | **795.6** |
+| batch 32 | 687.0 | **731.3** |
+
+The cost shows up in the resources: VGPRs go 64 -> 72 and LDS 20480 -> 28672
+bytes per workgroup, which drops the workgroups resident per WGP from 6 to 4.
+At this tile size there are already enough waves in flight to hide the global
+load latency, so paying occupancy to prefetch it explicitly is a straight loss.
+
+That is also why it *does* pay for inductor: its BLOCK_M=128 tile uses far more
+registers per workgroup and runs at much lower occupancy, so it has latency left
+to hide. The technique is not wrong, it is coupled to the tile size.
+
+## Lever 2: fusing residual + LayerScale + LayerNorm -- kept
+
+`triton_per_fused_add_mul_native_layer_norm_view` is the one inductor fusion
+worth copying. In a transformer block the residual add, the LayerScale multiply
+and the next LayerNorm always occur together, and splitting them costs a launch
+plus a full re-read of the residual stream.
+
+`residual_layernorm_f32.loom` does all three. The trick that makes it cheap:
+hidden_size <= 512 with 256 workitems means every workitem owns at most **two**
+channels, so the updated values stay in registers between the accumulate pass and
+the normalize pass and the re-read disappears entirely rather than merely being
+cached.
+
+Wiring it up needs the loop restructured -- only the very first `norm1` stands
+alone, every later LayerNorm is fused into the residual before it, *including
+across the layer boundary* (layer n's `ls2` residual pairs with layer n+1's
+`norm1`). The final norm writes f32 so it stays separate. That takes 49 launches
+per forward down to 26.
+
+**Kept.** Best of 3, alternating:
+
+| | fused | split |
+| --- | ---: | ---: |
+| batch 8 | **817.3** | 763.0 |
+| batch 32 | **800.3** | 764.8 |
+
++7.1% and +4.6%, accuracy unchanged.
