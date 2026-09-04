@@ -363,3 +363,31 @@ which is also the benchmark's input. Running it silently repointed every
 subsequent hand comparison at a different picture, and the next accuracy check
 read cosine 0.548 and looked like a catastrophic regression in a kernel that was
 in fact correct. It now writes to `/tmp/validate_patchified.bin`.
+
+## Lever 4: a 32-row attention query tile -- rejected
+
+K and V are re-staged once per query tile, so at 16 rows a 201-token image
+stages them 13 times. Widening to 32 rows halves that to 7, and it also gives the
+P*V phase 2x4 = 8 output fragments so all eight waves work instead of four. Both
+arguments are correct.
+
+It still loses, because the same change costs 53760 bytes of LDS against 40064
+and halves the workgroup count:
+
+| | 32-row | 16-row |
+| --- | ---: | ---: |
+| batch 8 | 801.9 | **902.4** |
+| batch 32 | **923.6** | 908.2 |
+
+The batch-32 gain is 1.7%, inside the noise floor. The batch-8 loss is 11% and is
+not: 8 images x 7 tiles x 6 heads is 336 workgroups where 16 rows gives 624, and
+the larger LDS footprint reduces residency on top of that. Kept in
+`experiments/flash_attention_f16_wmma_32row.loom`.
+
+Third negative in a row from the same cause, which is worth stating plainly:
+**on this part, at these sizes, anything that trades occupancy for locality
+loses.** Double-buffering, f16 q/k/v and the wider attention tile all failed that
+way. The changes that won -- LDS padding, operand fusion, f16 activations,
+SwiGLU as an epilogue -- all removed work or traffic without spending registers
+or LDS. The one apparent exception, the dual-N SwiGLU matmul, spends both but
+deletes an entire pass in exchange.

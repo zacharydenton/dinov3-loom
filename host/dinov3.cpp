@@ -133,6 +133,11 @@ int main(int argc, char **argv) {
     bool f16_qkv = false;
     bool fuse_norm = true;     // residual + LayerScale + LayerNorm in one kernel
     bool fuse_swiglu = true;   // gate/up projection with SwiGLU as its epilogue
+    // Query rows per attention workgroup. 32 was tried: it halves how often K
+    // and V are re-staged and gives P*V all eight waves instead of four, but it
+    // needs 53760 bytes of LDS against 40064 and produces half as many
+    // workgroups, and it lost at batch 8. See docs/notes.md.
+    int attn_tile = 16;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -150,6 +155,7 @@ int main(int argc, char **argv) {
         else if (a == "--f16-qkv") f16_qkv = true;
         else if (a == "--no-fuse-norm") fuse_norm = false;
         else if (a == "--no-fuse-swiglu") fuse_swiglu = false;
+        else if (a == "--attn-tile") attn_tile = std::stoi(next());
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -329,8 +335,8 @@ int main(int argc, char **argv) {
                 args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
                 if (wmma && flash_attn) {
                     Kernel &fa = narrow_qkv ? flash16_af16 : (narrow_act ? flash16 : flash);
-                    // One workgroup per (16 query rows within an image, head).
-                    launch(fa.function, batch * ((TOKENS + 15) / 16), HEADS, args);
+                    // One workgroup per (32 query rows within an image, head).
+                    launch(fa.function, batch * ((TOKENS + attn_tile - 1) / attn_tile), HEADS, args);
                 } else {
                     // One workgroup per (block of 8 queries within an image, head).
                     launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
