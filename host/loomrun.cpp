@@ -74,6 +74,11 @@ int main(int argc, char **argv) {
             args[arg_count].kind = ARG_BUFFER; args[arg_count].is_output = 0;
             snprintf(args[arg_count].path, sizeof(args[arg_count].path), "%s", NEXT());
             arg_count++;
+        } else if (!strcmp(a, "--inout")) {
+            // --inout path — uploaded, then written back after the launch.
+            args[arg_count].kind = ARG_BUFFER; args[arg_count].is_output = 2;
+            snprintf(args[arg_count].path, sizeof(args[arg_count].path), "%s", NEXT());
+            arg_count++;
         } else if (!strcmp(a, "--out")) {
             // --out path:bytes
             const char *spec = NEXT();
@@ -104,7 +109,7 @@ int main(int argc, char **argv) {
             kernarg_size = kernarg_append(kernarg, kernarg_size, &arg->scalar.f32, 4, 4);
         } else {
             void *host = NULL;
-            if (!arg->is_output) {
+            if (arg->is_output != 1) {
                 host = read_file(arg->path, &arg->bytes);
                 if (!host) return 1;
             }
@@ -126,9 +131,13 @@ int main(int argc, char **argv) {
 
     hipEvent_t start, stop;
     HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
-    HIP_CHECK(hipModuleLaunchKernel(function, grid[0], grid[1], grid[2],
-                                    block[0], block[1], block[2], 0, NULL, NULL, config));
-    HIP_CHECK(hipDeviceSynchronize());
+    // No warm-up when a single launch was asked for: in-place kernels must run
+    // exactly once or the correctness check sees the transform applied twice.
+    if (repeat > 1) {
+        HIP_CHECK(hipModuleLaunchKernel(function, grid[0], grid[1], grid[2],
+                                        block[0], block[1], block[2], 0, NULL, NULL, config));
+        HIP_CHECK(hipDeviceSynchronize());
+    }
     HIP_CHECK(hipEventRecord(start, NULL));
     for (int r = 0; r < repeat; ++r) {
         HIP_CHECK(hipModuleLaunchKernel(function, grid[0], grid[1], grid[2],

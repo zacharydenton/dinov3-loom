@@ -1,0 +1,186 @@
+// Multi-head attention for one (token, head) pair per workgroup.
+//
+//   out[t, h, :] = softmax(q[t, h, :] . k[:, h, :]^T * scale) @ v[:, h, :]
+//
+// q, k, v and out are all [tokens x hidden] with heads laid out contiguously
+// inside each token, which is exactly what the projection matmuls produce, so
+// no reshape or transpose is needed between them.
+//
+// 256 workitems: the first `token_count` of them each score one key, the
+// softmax is a two-stage LDS reduction, then the first `head_dim` of them each
+// accumulate one output channel.
+
+amdgpu.target<gfx11-generic> @dinov3_attention_gfx11_wave32 {subgroup_size = 32}
+
+config.decl @dinov3.attention_f32.hidden_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.attention_f32.head_dim : %value: index where [range(%value, 16, 256), mul(%value, 16)]
+
+config.decl @dinov3.attention_f32.scale : f32
+
+// Row stride of the q/k/v tensors. Equals hidden_size when they are separate
+// buffers, or the fused width when one matmul produced all three.
+config.decl @dinov3.attention_f32.qkv_stride : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
+
+kernel.def target(@dinov3_attention_gfx11_wave32) export("dinov3_attention_f32") @dinov3_attention_f32(%token_count: index, %head_count: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %head_count, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count0: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer) {
+  %hidden_size0 = config.get @dinov3.attention_f32.hidden_size : index
+  %head_dim0 = config.get @dinov3.attention_f32.head_dim : index
+  %scale = config.get @dinov3.attention_f32.scale : f32
+  %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 64, 8192), mul(%hidden_size0, 64)] : index
+  %head_dim = index.assume %head_dim0 [range(%head_dim0, 16, 256), mul(%head_dim0, 16)] : index
+  %qkv_stride0 = config.get @dinov3.attention_f32.qkv_stride : index
+  %qkv_stride = index.assume %qkv_stride0 [range(%qkv_stride0, 64, 32768), mul(%qkv_stride0, 64)] : index
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %lds_bytes = index.constant 8192 : offset
+  %zero = scalar.constant 0.0 : f32
+  %neg_inf = scalar.constant -3.4028234663852886e+38 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+
+  // The score row lives in the first 1024 LDS floats, so this kernel is only
+  // valid up to 1024 tokens. DINOv3 at 224px uses 201.
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 1024)] : index
+  %query0 = kernel.workgroup.id<x> : index
+  %head = kernel.workgroup.id<y> : index
+  %workitem = kernel.workitem.id<x> : index
+  %subgroup0 = kernel.subgroup.id : index
+  %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
+  %lane = kernel.subgroup.lane.id : index
+
+  %query_valid = index.cmp ult, %query0, %token_count : index
+  %safe_query = scf.select %query_valid, %query0, %c0 : index
+  %query = index.assume %safe_query [lt(%safe_query, %token_count)] : index
+  %head_base = index.mul %head, %head_dim : index
+
+  %q_global = buffer.assume.memory_space<global> %q : buffer
+  %k_global = buffer.assume.memory_space<global> %k : buffer
+  %v_global = buffer.assume.memory_space<global> %v : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %q_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%token_count]x[%qkv_stride]xf32>
+  %k_view = buffer.view %k_global[%c0_offset] : buffer -> view<[%token_count]x[%qkv_stride]xf32>
+  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%token_count]x[%qkv_stride]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+
+  // LDS: [0, 1024) scores, [1024, 1032) subgroup reduction scratch.
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %scores = buffer.view %lds[%c0_offset] : buffer -> view<2048xf32>
+  %c1024 = index.constant 1024 : index
+
+  // 1. scores, and each workitem's running max.
+  %thread_max = scf.for %key = [%workitem to %token_count step %c256](%running = %neg_inf : f32) -> (f32) {
+    %dot = scf.for %channel = [%c0 to %head_dim step %c1](%sum = %zero : f32) -> (f32) {
+      %slot0 = index.add %head_base, %channel : index
+      %slot = index.assume %slot0 [lt(%slot0, %qkv_stride)] : index
+      %q_value = view.load %q_view[%query, %slot] : view<[%token_count]x[%qkv_stride]xf32> -> f32
+      %k_value = view.load %k_view[%key, %slot] : view<[%token_count]x[%qkv_stride]xf32> -> f32
+      %next = scalar.fmaf<contract> %q_value, %k_value, %sum : f32
+      scf.yield %next : f32
+    }
+    %scaled = scalar.mulf %dot, %scale : f32
+    view.store %scaled, %scores[%key] : f32, view<2048xf32>
+    %next_max = scalar.maxnumf %running, %scaled : f32
+    scf.yield %next_max : f32
+  }
+
+  // 2. workgroup max.
+  %subgroup_max = kernel.subgroup.reduce<maxnumf> %thread_max : f32
+  %is_leader = index.cmp eq, %lane, %c0 : index
+  %scratch_base = index.add %c1024, %subgroup : index
+  scf.if %is_leader {
+    view.store %subgroup_max, %scores[%scratch_base] : f32, view<2048xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %is_first_subgroup = index.cmp eq, %subgroup, %c0 : index
+  %is_reduction_lane = index.cmp ult, %lane, %c8 : index
+  %reduces = scalar.andi %is_first_subgroup, %is_reduction_lane : i1
+  %partial_max = scf.if %reduces -> (f32) {
+    %slot = index.add %c1024, %lane : index
+    %value = view.load %scores[%slot] : view<2048xf32> -> f32
+    scf.yield %value : f32
+  } else {
+    scf.yield %neg_inf : f32
+  }
+  %group_max = kernel.subgroup.reduce<maxnumf> %partial_max : f32
+  %writes = scalar.andi %is_first_subgroup, %is_leader : i1
+  %max_slot = index.constant 1032 : index
+  scf.if %writes {
+    view.store %group_max, %scores[%max_slot] : f32, view<2048xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %row_max = view.load %scores[%max_slot] : view<2048xf32> -> f32
+
+  // 3. exponentiate in place and sum.
+  %thread_sum = scf.for %key = [%workitem to %token_count step %c256](%running = %zero : f32) -> (f32) {
+    %value = view.load %scores[%key] : view<2048xf32> -> f32
+    %centered = scalar.subf %value, %row_max : f32
+    %weight = scalar.expf<afn> %centered : f32
+    view.store %weight, %scores[%key] : f32, view<2048xf32>
+    %next = scalar.addf<reassoc|nnan|ninf|nsz> %running, %weight : f32
+    scf.yield %next : f32
+  }
+  %subgroup_sum = kernel.subgroup.reduce<addf> %thread_sum : f32
+  scf.if %is_leader {
+    view.store %subgroup_sum, %scores[%scratch_base] : f32, view<2048xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %partial_sum = scf.if %reduces -> (f32) {
+    %slot = index.add %c1024, %lane : index
+    %value = view.load %scores[%slot] : view<2048xf32> -> f32
+    scf.yield %value : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %group_sum = kernel.subgroup.reduce<addf> %partial_sum : f32
+  %sum_slot = index.constant 1033 : index
+  scf.if %writes {
+    view.store %group_sum, %scores[%sum_slot] : f32, view<2048xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %row_sum = view.load %scores[%sum_slot] : view<2048xf32> -> f32
+  %inverse_sum = scalar.divf<arcp> %c1_f32, %row_sum : f32
+
+  // 4. weighted sum of V. All 256 workitems take part: the head_dim channels
+  // are spread over (256 / head_dim) key-strided groups whose partial sums are
+  // combined through LDS, rather than leaving 192 of 256 lanes idle.
+  %partial_base = index.constant 1088 : index
+  %group = index.div %workitem, %head_dim : index
+  %channel = index.rem %workitem, %head_dim : index
+  %group_count = index.div %c256, %head_dim : index
+  %slot0 = index.add %head_base, %channel : index
+  %slot = index.assume %slot0 [lt(%slot0, %qkv_stride)] : index
+  %partial = scf.for %key = [%group to %token_count step %group_count](%sum = %zero : f32) -> (f32) {
+    %weight = view.load %scores[%key] : view<2048xf32> -> f32
+    %v_value = view.load %v_view[%key, %slot] : view<[%token_count]x[%qkv_stride]xf32> -> f32
+    %next = scalar.fmaf<contract> %weight, %v_value, %sum : f32
+    scf.yield %next : f32
+  }
+  %partial_slot = index.add %partial_base, %workitem : index
+  view.store %partial, %scores[%partial_slot] : f32, view<2048xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %combines = index.cmp ult, %workitem, %head_dim : index
+  %writes_out = scalar.andi %combines, %query_valid : i1
+  scf.if %writes_out {
+    %total = scf.for %g = [%c0 to %group_count step %c1](%sum = %zero : f32) -> (f32) {
+      %offset = index.mul %g, %head_dim : index
+      %index0 = index.add %offset, %workitem : index
+      %index1 = index.add %index0, %partial_base : index
+      %value = view.load %scores[%index1] : view<2048xf32> -> f32
+      %next = scalar.addf<reassoc|nnan|ninf|nsz> %sum, %value : f32
+      scf.yield %next : f32
+    }
+    %out_slot0 = index.add %head_base, %workitem : index
+    %out_slot = index.assume %out_slot0 [lt(%out_slot0, %hidden_size)] : index
+    %result = scalar.mulf %total, %inverse_sum : f32
+    view.store %result, %out_view[%query, %out_slot] : f32, view<[%token_count]x[%hidden_size]xf32>
+  }
+  kernel.return
+}

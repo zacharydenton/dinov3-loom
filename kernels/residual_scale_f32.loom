@@ -1,0 +1,44 @@
+// LayerScale plus residual, fused: x[t, c] += z[t, c] * lambda[c].
+//
+// This is DINOv3's `hidden_states = layer_scale(branch) + residual`, done in
+// place on the residual stream so no extra buffer is needed.
+
+amdgpu.target<gfx11-generic> @dinov3_residual_gfx11_wave32 {subgroup_size = 32}
+
+config.decl @dinov3.residual_scale_f32.hidden_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+kernel.def target(@dinov3_residual_gfx11_wave32) export("dinov3_residual_scale_f32") @dinov3_residual_scale_f32(%token_count: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %x: buffer, %branch: buffer, %lambda: buffer) {
+  %hidden_size0 = config.get @dinov3.residual_scale_f32.hidden_size : index
+  %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 64, 8192), mul(%hidden_size0, 64)] : index
+  %c0 = index.constant 0 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+
+  %token0 = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %valid = index.cmp ult, %token0, %token_count : index
+  %safe_token = scf.select %valid, %token0, %c0 : index
+  %token = index.assume %safe_token [lt(%safe_token, %token_count)] : index
+
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %branch_global = buffer.assume.memory_space<global> %branch : buffer
+  %lambda_global = buffer.assume.memory_space<global> %lambda : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %branch_view = buffer.view %branch_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %lambda_view = buffer.view %lambda_global[%c0_offset] : buffer -> view<[%hidden_size]xf32>
+
+  scf.if %valid {
+    scf.for %channel = [%workitem to %hidden_size step %c256] {
+      %residual = view.load %x_view[%token, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
+      %branch_value = view.load %branch_view[%token, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
+      %scale = view.load %lambda_view[%channel] : view<[%hidden_size]xf32> -> f32
+      %result = scalar.fmaf<contract> %branch_value, %scale, %residual : f32
+      view.store %result, %x_view[%token, %channel] : f32, view<[%token_count]x[%hidden_size]xf32>
+    }
+  }
+  kernel.return
+}

@@ -1,0 +1,91 @@
+// DINOv3 axial RoPE, applied in place to a [tokens x hidden] q or k tensor.
+//
+//   x'[t, h, d] = x[t, h, d] * cos[t - prefix, d]
+//               + (d < half ? -x[t, h, d + half] : x[t, h, d - half]) * sin[t - prefix, d]
+//
+// The first `prefix` tokens (CLS + 4 registers) are left untouched, matching
+// transformers' apply_rotary_pos_emb, which splits them off before rotating.
+// cos/sin are [patches x head_dim] tables shared by every head.
+
+amdgpu.target<gfx11-generic> @dinov3_rope_gfx11_wave32 {subgroup_size = 32}
+
+config.decl @dinov3.rope_2d_f32.hidden_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.rope_2d_f32.head_dim : %value: index where [range(%value, 16, 512), mul(%value, 16)]
+
+config.decl @dinov3.rope_2d_f32.prefix : %value: index where [range(%value, 0, 64)]
+
+// Row stride of the tensor being rotated. Equals hidden_size for a standalone
+// q or k, or the fused width when q/k/v share one matmul output.
+config.decl @dinov3.rope_2d_f32.row_stride : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
+
+kernel.def target(@dinov3_rope_gfx11_wave32) export("dinov3_rope_2d_f32") @dinov3_rope_2d_f32(%token_count: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %x: buffer, %cos: buffer, %sin: buffer) {
+  %hidden_size0 = config.get @dinov3.rope_2d_f32.hidden_size : index
+  %head_dim0 = config.get @dinov3.rope_2d_f32.head_dim : index
+  %prefix0 = config.get @dinov3.rope_2d_f32.prefix : index
+  %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 64, 8192), mul(%hidden_size0, 64)] : index
+  %head_dim = index.assume %head_dim0 [range(%head_dim0, 16, 512), mul(%head_dim0, 16)] : index
+  %prefix = index.assume %prefix0 [range(%prefix0, 0, 64)] : index
+  %row_stride0 = config.get @dinov3.rope_2d_f32.row_stride : index
+  %row_stride = index.assume %row_stride0 [range(%row_stride0, 64, 32768), mul(%row_stride0, 64)] : index
+
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+
+  %token0 = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %half = index.div %head_dim, %c2 : index
+
+  %in_bounds = index.cmp ult, %token0, %token_count : index
+  %safe_token = scf.select %in_bounds, %token0, %c0 : index
+  %token = index.assume %safe_token [lt(%safe_token, %token_count)] : index
+  %past_prefix = index.cmp uge, %token, %prefix : index
+  %rotates = scalar.andi %in_bounds, %past_prefix : i1
+  scf.if %rotates {
+    %position0 = index.sub %token, %prefix : index
+    %position = index.assume %position0 [lt(%position0, %token_count)] : index
+    %x_global = buffer.assume.memory_space<global> %x : buffer
+    %cos_global = buffer.assume.memory_space<global> %cos : buffer
+    %sin_global = buffer.assume.memory_space<global> %sin : buffer
+    %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%row_stride]xf32>
+    %cos_view = buffer.view %cos_global[%c0_offset] : buffer -> view<[%token_count]x[%head_dim]xf32>
+    %sin_view = buffer.view %sin_global[%c0_offset] : buffer -> view<[%token_count]x[%head_dim]xf32>
+
+    // Each workitem owns one (low, high) channel pair of one head, so the
+    // rotation is race-free in place: both reads happen before either store.
+    %pair_count = index.div %hidden_size, %c2 : index
+    scf.for %pair = [%workitem to %pair_count step %c256] {
+      %head = index.div %pair, %half : index
+      %channel = index.rem %pair, %half : index
+      %head_base = index.mul %head, %head_dim : index
+      %low_slot0 = index.add %head_base, %channel : index
+      %low_slot = index.assume %low_slot0 [lt(%low_slot0, %row_stride)] : index
+      %high_channel = index.add %channel, %half : index
+      %high_slot0 = index.add %head_base, %high_channel : index
+      %high_slot = index.assume %high_slot0 [lt(%high_slot0, %row_stride)] : index
+
+      %low = view.load %x_view[%token, %low_slot] : view<[%token_count]x[%row_stride]xf32> -> f32
+      %high = view.load %x_view[%token, %high_slot] : view<[%token_count]x[%row_stride]xf32> -> f32
+      %cos_low = view.load %cos_view[%position, %channel] : view<[%token_count]x[%head_dim]xf32> -> f32
+      %sin_low = view.load %sin_view[%position, %channel] : view<[%token_count]x[%head_dim]xf32> -> f32
+      %cos_high = view.load %cos_view[%position, %high_channel] : view<[%token_count]x[%head_dim]xf32> -> f32
+      %sin_high = view.load %sin_view[%position, %high_channel] : view<[%token_count]x[%head_dim]xf32> -> f32
+
+      %negated_high = scalar.negf %high : f32
+      %low_scaled = scalar.mulf %low, %cos_low : f32
+      %new_low = scalar.fmaf<contract> %negated_high, %sin_low, %low_scaled : f32
+      %high_scaled = scalar.mulf %high, %cos_high : f32
+      %new_high = scalar.fmaf<contract> %low, %sin_high, %high_scaled : f32
+
+      view.store %new_low, %x_view[%token, %low_slot] : f32, view<[%token_count]x[%row_stride]xf32>
+      view.store %new_high, %x_view[%token, %high_slot] : f32, view<[%token_count]x[%row_stride]xf32>
+    }
+  }
+  kernel.return
+}

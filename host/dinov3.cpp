@@ -1,0 +1,285 @@
+// DINOv3 ViT-S+/16 forward pass on gfx1151, entirely in Loom-compiled kernels.
+//
+//   dinov3 --weights build/weights --kernels build/kernels \
+//          --input patchified.bin --output out.bin [--repeat 50]
+//
+// The input is a pre-patchified [196 x 768] f32 image; patch extraction is a
+// pure reshape (16x16 patches, stride 16) and stays on the host.
+#include <hip/hip_runtime.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <algorithm>
+#include <chrono>
+#include <string>
+#include <vector>
+
+#define HIP_CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
+    fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); \
+    exit(1); } } while (0)
+
+namespace {
+
+// --profile: synchronise after every launch and attribute the time to a stage.
+bool g_profile = false;
+std::map<std::string, double> g_stage_us;
+std::map<std::string, int> g_stage_calls;
+
+struct Stage {
+    const char *name;
+    std::chrono::steady_clock::time_point start;
+    explicit Stage(const char *n) : name(n) {
+        if (g_profile) start = std::chrono::steady_clock::now();
+    }
+    ~Stage() {
+        if (!g_profile) return;
+        (void)hipDeviceSynchronize();
+        auto us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start).count();
+        g_stage_us[name] += us;
+        g_stage_calls[name] += 1;
+    }
+};
+
+constexpr int HIDDEN = 384;
+constexpr int HEADS = 6;
+constexpr int HEAD_DIM = HIDDEN / HEADS;
+constexpr int LAYERS = 12;
+constexpr int INTERMEDIATE = 1536;
+constexpr int PREFIX = 5;          // CLS + 4 registers
+constexpr int PATCHES = 196;
+constexpr int TOKENS = PREFIX + PATCHES;
+constexpr int PATCH_K = 768;       // 3 * 16 * 16
+constexpr int THREADS = 256;
+constexpr int TILE = 64;           // wide matmul workgroup tile
+constexpr int TILE_NARROW = 32;    // N tile for the narrow projections
+constexpr int QKV = 3 * HIDDEN;          // fused q|k|v projection width
+constexpr int GATEUP = 2 * INTERMEDIATE; // fused gate|up projection width
+
+struct Span { size_t offset; size_t count; };
+
+std::map<std::string, Span> read_manifest(const std::string &path) {
+    std::map<std::string, Span> spans;
+    std::ifstream in(path);
+    if (!in) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+    std::string name; size_t offset, count;
+    while (in >> name >> offset >> count) spans[name] = {offset, count};
+    return spans;
+}
+
+std::vector<char> read_file(const std::string &path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+    std::vector<char> buffer(in.tellg());
+    in.seekg(0);
+    in.read(buffer.data(), buffer.size());
+    return buffer;
+}
+
+// One compiled kernel plus the module that owns it.
+struct Kernel {
+    hipFunction_t function = nullptr;
+    void load(const std::string &dir, const std::string &stem, const char *symbol) {
+        hipModule_t module;
+        HIP_CHECK(hipModuleLoad(&module, (dir + "/" + stem + ".hsaco").c_str()));
+        HIP_CHECK(hipModuleGetFunction(&function, module, symbol));
+    }
+};
+
+// Loom's AMDGPU kernarg ABI: scalars at natural alignment, then 8-byte pointers.
+struct KernArgs {
+    unsigned char bytes[128] = {0};
+    size_t size = 0;
+    void scalar_i32(int value) {
+        size = (size + 3) & ~size_t(3);
+        memcpy(bytes + size, &value, 4);
+        size += 4;
+    }
+    void pointer(const void *value) {
+        size = (size + 7) & ~size_t(7);
+        memcpy(bytes + size, &value, 8);
+        size += 8;
+    }
+};
+
+void launch(hipFunction_t function, unsigned gx, unsigned gy, KernArgs &args) {
+    void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes,
+                       HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size,
+                       HIP_LAUNCH_PARAM_END };
+    HIP_CHECK(hipModuleLaunchKernel(function, gx, gy, 1, THREADS, 1, 1, 0, nullptr,
+                                    nullptr, config));
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+    std::string weights_dir = "build/weights", kernels_dir = "build/kernels";
+    std::string input_path, output_path;
+    int repeat = 1;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() { return std::string(argv[++i]); };
+        if (a == "--weights") weights_dir = next();
+        else if (a == "--kernels") kernels_dir = next();
+        else if (a == "--input") input_path = next();
+        else if (a == "--output") output_path = next();
+        else if (a == "--repeat") repeat = std::stoi(next());
+        else if (a == "--profile") g_profile = true;
+        else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
+    }
+
+    auto spans = read_manifest(weights_dir + "/manifest.txt");
+    auto blob = read_file(weights_dir + "/weights.bin");
+
+    HIP_CHECK(hipInit(0));
+    float *weights = nullptr;
+    HIP_CHECK(hipMalloc(&weights, blob.size()));
+    HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)weights, blob.data(), blob.size()));
+    auto W = [&](const std::string &name) -> float * {
+        auto it = spans.find(name);
+        if (it == spans.end()) { fprintf(stderr, "missing weight %s\n", name.c_str()); exit(1); }
+        return weights + it->second.offset;
+    };
+
+    Kernel layernorm, rope, attention, swiglu, residual;
+    Kernel matmul_patch, matmul_qkvo, matmul_qkv, matmul_gateup, matmul_down;
+    layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
+    rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
+    attention.load(kernels_dir, "attention", "dinov3_attention_f32");
+    swiglu.load(kernels_dir, "swiglu", "dinov3_swiglu_f32");
+    residual.load(kernels_dir, "residual", "dinov3_residual_scale_f32");
+    matmul_patch.load(kernels_dir, "matmul_k768_n384", "dinov3_matmul_bias_f32");
+    matmul_qkvo.load(kernels_dir, "matmul_narrow_k384_n384", "dinov3_matmul_bias_f32_narrow");
+    matmul_qkv.load(kernels_dir, "matmul_k384_n1152", "dinov3_matmul_bias_f32");
+    matmul_gateup.load(kernels_dir, "matmul_k384_n3072", "dinov3_matmul_bias_f32");
+    matmul_down.load(kernels_dir, "matmul_narrow_k1536_n384", "dinov3_matmul_bias_f32_narrow");
+
+    float *x, *h, *q, *k, *v, *attn, *proj, *gate, *up, *act, *mlp, *out, *image;
+    auto alloc = [](float **p, size_t floats) { HIP_CHECK(hipMalloc(p, floats * sizeof(float))); };
+    alloc(&x, TOKENS * HIDDEN);      alloc(&h, TOKENS * HIDDEN);
+    alloc(&q, TOKENS * QKV);         alloc(&attn, TOKENS * HIDDEN);
+    alloc(&proj, TOKENS * HIDDEN);   alloc(&mlp, TOKENS * HIDDEN);
+    alloc(&gate, TOKENS * GATEUP);
+    alloc(&act, TOKENS * INTERMEDIATE);  alloc(&out, TOKENS * HIDDEN);
+    k = q + HIDDEN; v = q + 2 * HIDDEN; up = gate + INTERMEDIATE;
+    alloc(&image, PATCHES * PATCH_K);
+
+    if (!input_path.empty()) {
+        auto pixels = read_file(input_path);
+        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)image, pixels.data(),
+                                size_t(PATCHES) * PATCH_K * sizeof(float)));
+    }
+
+    auto matmul = [&](Kernel &kernel, int m, int n, const float *a, const float *w,
+                      const float *bias, float *c, int tile_n = TILE) {
+        KernArgs args;
+        args.scalar_i32(m);
+        args.pointer(a); args.pointer(w); args.pointer(bias); args.pointer(c);
+        launch(kernel.function, n / tile_n, (m + TILE - 1) / TILE, args);
+    };
+    auto norm = [&](const float *in, const float *gamma, const float *beta, float *dst) {
+        KernArgs args;
+        args.scalar_i32(TOKENS);
+        args.pointer(in); args.pointer(gamma); args.pointer(beta); args.pointer(dst);
+        launch(layernorm.function, TOKENS, 1, args);
+    };
+
+    auto forward = [&]() {
+        // Patch embedding writes straight into the residual stream behind the
+        // CLS and register tokens, so no copy is needed afterwards.
+        { Stage stage("patch-embed matmul");
+          matmul(matmul_patch, PATCHES, HIDDEN, image, W("patch_w"), W("patch_b"),
+                 x + PREFIX * HIDDEN); }
+        HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)x, (hipDeviceptr_t)W("prefix"),
+                                size_t(PREFIX) * HIDDEN * sizeof(float)));
+
+        for (int layer = 0; layer < LAYERS; ++layer) {
+            std::string p = "l" + std::to_string(layer) + "_";
+            { Stage stage("layernorm"); norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h); }
+            { Stage stage("qkv matmul");
+              matmul(matmul_qkv, TOKENS, QKV, h, W(p + "qkv_w"), W(p + "qkv_b"), q); }
+
+            { Stage stage("rope");
+            for (float *target : {q, k}) {
+                KernArgs args;
+                args.scalar_i32(TOKENS);
+                args.pointer(target); args.pointer(W("rope_cos")); args.pointer(W("rope_sin"));
+                launch(rope.function, TOKENS, 1, args);
+            } }
+            { Stage stage("attention");
+                KernArgs args;
+                args.scalar_i32(TOKENS);
+                args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
+                launch(attention.function, TOKENS, HEADS, args);
+            }
+            { Stage stage("o matmul");
+              matmul(matmul_qkvo, TOKENS, HIDDEN, attn, W(p + "o_w"), W(p + "o_b"), proj, TILE_NARROW); }
+            { Stage stage("residual+ls");
+                KernArgs args;
+                args.scalar_i32(TOKENS);
+                args.pointer(x); args.pointer(proj); args.pointer(W(p + "ls1"));
+                launch(residual.function, TOKENS, 1, args);
+            }
+
+            { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h); }
+            { Stage stage("gate/up matmul");
+              matmul(matmul_gateup, TOKENS, GATEUP, h, W(p + "gateup_w"), W(p + "gateup_b"), gate); }
+            { Stage stage("swiglu");
+                KernArgs args;
+                args.scalar_i32(TOKENS);
+                args.pointer(gate); args.pointer(up); args.pointer(act);
+                launch(swiglu.function, TOKENS, 1, args);
+            }
+            { Stage stage("down matmul");
+              matmul(matmul_down, TOKENS, HIDDEN, act, W(p + "down_w"), W(p + "down_b"), mlp, TILE_NARROW); }
+            { Stage stage("residual+ls");
+                KernArgs args;
+                args.scalar_i32(TOKENS);
+                args.pointer(x); args.pointer(mlp); args.pointer(W(p + "ls2"));
+                launch(residual.function, TOKENS, 1, args);
+            }
+        }
+        { Stage stage("layernorm"); norm(x, W("norm_w"), W("norm_b"), out); }
+    };
+
+    forward();
+    HIP_CHECK(hipDeviceSynchronize());
+
+    if (repeat > 1) {
+        hipEvent_t start, stop;
+        HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
+        HIP_CHECK(hipEventRecord(start, nullptr));
+        for (int r = 0; r < repeat; ++r) forward();
+        HIP_CHECK(hipEventRecord(stop, nullptr));
+        HIP_CHECK(hipDeviceSynchronize());
+        float elapsed = 0.0f;
+        HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
+        printf("{\"images\": %d, \"total_ms\": %.3f, \"ms_per_image\": %.3f, \"img_per_s\": %.2f}\n",
+               repeat, elapsed, elapsed / repeat, 1000.0 * repeat / elapsed);
+    }
+
+    if (g_profile) {
+        double total = 0.0;
+        for (auto &kv : g_stage_us) total += kv.second;
+        std::vector<std::pair<double, std::string>> rows;
+        for (auto &kv : g_stage_us) rows.push_back({kv.second, kv.first});
+        std::sort(rows.rbegin(), rows.rend());
+        printf("stage breakdown over %d image(s):\n", repeat > 1 ? repeat + 1 : 1);
+        for (auto &r : rows)
+            printf("  %-20s %9.3f ms  %5.1f%%  (%d launches)\n", r.second.c_str(),
+                   r.first / 1000.0, 100.0 * r.first / total, g_stage_calls[r.second]);
+        printf("  %-20s %9.3f ms\n", "total", total / 1000.0);
+    }
+
+    if (!output_path.empty()) {
+        std::vector<float> host(size_t(TOKENS) * HIDDEN);
+        HIP_CHECK(hipMemcpyDtoH(host.data(), (hipDeviceptr_t)out, host.size() * sizeof(float)));
+        std::ofstream(output_path, std::ios::binary)
+            .write(reinterpret_cast<char *>(host.data()), host.size() * sizeof(float));
+    }
+    return 0;
+}

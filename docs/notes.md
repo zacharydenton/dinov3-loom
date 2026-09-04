@@ -61,3 +61,40 @@ and HSA's completion thread trips a `std::vector` bounds assert as soon as HRX o
 a queue. `scripts/env.sh` puts `~/.local/rocm-hrx` (ROCm 7.14, extracted from the
 kyuz0 Strix Halo toolbox) ahead of it. `host/loomrun` links real ROCm HIP and is
 unaffected.
+
+## Matmul: what actually moved the needle
+
+Measured on gfx1151 with the four shapes DINOv3 ViT-S+ uses, in order of payoff:
+
+1. **Pad the LDS row stride to KC+1.** The 64x64 tile stages A and W slabs as
+   `[TILE][KC]` with KC = 32 floats. A workitem's four A reads per k-step are then
+   exactly 32 floats apart, which is the LDS bank count — every one of them hits
+   the same bank. Changing the row stride to 33 spread them across four banks and
+   took `gate/up` from 161 to 2007 GFLOP/s. **One constant, 10x.** This was by far
+   the largest single change in the project.
+2. **Fuse q/k/v into one [1152, 384] matmul, and gate/up into [3072, 384].**
+   At 201 tokens a 64x64 tile over N=384 is only 24 workgroups on a 40-CU part.
+   Fusing turns three launches of 24 into one of 72, and two of 96 into one of
+   192. 46 -> 80 img/s. The weights are concatenated at export time, and rope,
+   attention and swiglu grew a `row_stride` config so they can read their slice
+   of a fused buffer in place rather than needing a de-interleave pass.
+3. **A 64x32 tile for the narrow projections.** `o_proj` and `down_proj` have
+   N=384 and cannot be fused with anything. Halving the N tile doubles their
+   workgroup count while keeping the 4-deep micro-tile in M. 80 -> 94 img/s.
+4. **Spread attention's V accumulation over all 256 lanes.** The first version
+   gave one output channel to each of the first `head_dim` workitems and left the
+   other 192 idle. Splitting the keys into `256 / head_dim` strided groups and
+   combining their partials through LDS cut attention from 19% to well under it.
+
+Tile shapes that lost: 32x32 (four times the workgroups, but 2x2 micro-tiles
+halve the compute-to-LDS ratio) and 48x48. 64x64 for wide N, 64x32 for narrow N
+is the configuration in the repo.
+
+## Benchmarking on a busy machine
+
+`/sys/class/drm/card1/device/pp_dpm_sclk` showed the GPU pinned at 953 MHz out of
+2900 with `gpu_busy_percent` at 54 while two unrelated jobs were running. Isolated
+kernel timings varied by 5x run to run, which made a tile-shape sweep almost
+useless. `tools/benchmark.py` interleaves the Loom and torch measurements and
+keeps the best of N rounds per configuration, so both sides see the same
+contention and the reported number is the least-disturbed sample.
