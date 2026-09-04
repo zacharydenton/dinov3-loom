@@ -165,6 +165,9 @@ int main(int argc, char **argv) {
     // Fold the residual add and LayerScale into the o/down epilogue, which
     // removes the branch tensor and leaves a plain LayerNorm behind.
     bool fuse_resid = true;
+    // One LayerNorm row per wave rather than per workgroup: no LDS, no
+    // barriers, and the row stays in registers between the two passes.
+    bool rowwave_norm = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -188,6 +191,7 @@ int main(int argc, char **argv) {
         else if (a == "--splitk-rows") splitk_rows = std::stoi(next());
         else if (a == "--qkv-rope-rows") qkv_rope_rows = std::stoi(next());
         else if (a == "--no-fuse-resid") fuse_resid = false;
+        else if (a == "--no-rowwave-norm") rowwave_norm = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -226,6 +230,7 @@ int main(int argc, char **argv) {
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
     Kernel attn_online, wmma_o16_cf16, wmma_down16_cf16, residual_norm16, residual16;
     Kernel splitk_down, splitk_reduce, qkv_rope, resid_o, resid_down;
+    Kernel ln_rowwave, ln_rowwave_f32;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -267,6 +272,8 @@ int main(int argc, char **argv) {
     qkv_rope.load(kernels_dir, "qkv_rope_k384_n1152", "dinov3_matmul_qkv_rope_f16_wmma");
     resid_o.load(kernels_dir, "resid_k384_n384", "dinov3_matmul_resid_f16_wmma");
     resid_down.load(kernels_dir, "resid_k1536_n384", "dinov3_matmul_resid_f16_wmma");
+    ln_rowwave.load(kernels_dir, "layernorm_rowwave", "dinov3_layernorm_rowwave_f16");
+    ln_rowwave_f32.load(kernels_dir, "layernorm_rowwave_f32out", "dinov3_layernorm_rowwave_f32out");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -341,7 +348,13 @@ int main(int argc, char **argv) {
         KernArgs args;
         args.scalar_i32(rows);
         args.pointer(in); args.pointer(gamma); args.pointer(beta); args.pointer(dst);
-        launch(narrow ? layernorm16.function : layernorm.function, rows, 1, args);
+        if (rowwave_norm) {
+            // One row per wave, so eight rows per workgroup.
+            launch(narrow ? ln_rowwave.function : ln_rowwave_f32.function,
+                   (rows + 7) / 8, 1, args);
+        } else {
+            launch(narrow ? layernorm16.function : layernorm.function, rows, 1, args);
+        }
     };
 
     // x += branch * lambda, then LayerNorm(x) -> f16 dst, in one launch.

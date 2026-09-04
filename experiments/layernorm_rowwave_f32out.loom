@@ -1,0 +1,113 @@
+// VARIANT of layernorm_rowwave_f16 with an f32 output, for the final norm.
+// LayerNorm with one row per *wave* instead of one row per workgroup.
+//
+// The workgroup version needed a cross-wave reduction: LDS scratch, two
+// workgroup barriers, and a second read of the row from global because the
+// values could not be held across them. A wave owns a whole row here, so the
+// reduction is a single kernel.subgroup.reduce -- no LDS, no barriers -- and
+// the row stays in registers between the two passes, halving the read traffic.
+//
+// hidden_size must be a multiple of 128 so that 32 lanes x vector4 tiles it
+// exactly; at 384 each lane holds three vector4s, twelve channels, in registers.
+
+amdgpu.target<gfx11-generic> @dinov3_layernorm_rowwave_f32out_gfx11 {subgroup_size = 32}
+
+config.decl @dinov3.layernorm_rowwave_f32out.hidden_size : %value: index where [range(%value, 128, 1024), mul(%value, 128)]
+
+config.decl @dinov3.layernorm_rowwave_f32out.epsilon : f32
+
+kernel.def target(@dinov3_layernorm_rowwave_f32out_gfx11) export("dinov3_layernorm_rowwave_f32out") @dinov3_layernorm_rowwave_f32out(%token_count: index) {
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c7 = index.constant 7 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %token_count, %c7 : index
+  %groups = index.div %rounded, %c8 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %input: buffer, %gamma: buffer, %beta: buffer, %output: buffer) {
+  %hidden_size = config.get @dinov3.layernorm_rowwave_f32out.hidden_size : index
+  %epsilon = config.get @dinov3.layernorm_rowwave_f32out.epsilon : f32
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c128 = index.constant 128 : index
+  %c0_offset = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %zero4 = vector.constant 0.0 : vector<4xf32>
+
+  %group = kernel.workgroup.id<x> : index
+  %subgroup0 = kernel.subgroup.id : index
+  %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
+  %lane = kernel.subgroup.lane.id : index
+
+  %group_base = index.mul %group, %c8 : index
+  %row0 = index.add %group_base, %subgroup : index
+  %valid = index.cmp ult, %row0, %token_count : index
+  %safe_row = scf.select %valid, %row0, %c0 : index
+  %row = index.assume %safe_row [lt(%safe_row, %token_count)] : index
+
+  %hidden_i32 = index.cast %hidden_size : index to i32
+  %hidden_f32 = scalar.sitofp %hidden_i32 : i32 to f32
+  %lane_base = index.mul %lane, %c4 : index
+  %steps = index.div %hidden_size, %c128 : index
+
+  %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+  %input_view = buffer.view %input_noalias[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>
+  %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %gamma_view = buffer.view %gamma[%c0_offset] : buffer -> view<[%hidden_size]xf32>
+  %beta_view = buffer.view %beta[%c0_offset] : buffer -> view<[%hidden_size]xf32>
+
+  // Pass 1. Three vector4s per lane at hidden 384; they stay live through the
+  // reduction and are reused in pass 2, so the row is read once.
+  %v0_pre, %v1_pre, %v2_pre, %sum, %sumsq = scf.for %step = [%c0 to %steps step %c1](%a0 = %zero4 : vector<4xf32>, %a1 = %zero4 : vector<4xf32>, %a2 = %zero4 : vector<4xf32>, %s = %c0_f32 : f32, %q = %c0_f32 : f32) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, f32, f32) unroll {
+    %offset = index.mul %step, %c128 : index
+    %channel = index.add %offset, %lane_base : index
+    %half = vector.load %input_view[%row, %channel] : view<[%token_count]x[%hidden_size]xf16> -> vector<4xf16>
+    %wide = vector.extf %half : vector<4xf16> to vector<4xf32>
+    %part = vector.reduce<addf, reassoc|nnan|ninf|nsz> %wide, %c0_f32 : vector<4xf32>, f32
+    %square = vector.mulf<reassoc|nnan|ninf|nsz> %wide, %wide : vector<4xf32>
+    %part_sq = vector.reduce<addf, reassoc|nnan|ninf|nsz> %square, %c0_f32 : vector<4xf32>, f32
+    %next_s = scalar.addf<reassoc|nnan|ninf|nsz> %s, %part : f32
+    %next_q = scalar.addf<reassoc|nnan|ninf|nsz> %q, %part_sq : f32
+    %is0 = index.cmp eq, %step, %c0 : index
+    %is1 = index.cmp eq, %step, %c1 : index
+    %n0 = scf.select %is0, %wide, %a0 : vector<4xf32>
+    %n1 = scf.select %is1, %wide, %a1 : vector<4xf32>
+    %n2 = scf.select %is0, %a2, %wide : vector<4xf32>
+    %n2b = scf.select %is1, %a2, %n2 : vector<4xf32>
+    scf.yield %n0, %n1, %n2b, %next_s, %next_q : vector<4xf32>, vector<4xf32>, vector<4xf32>, f32, f32
+  }
+
+  // The whole row lives in this one wave, so no LDS and no barrier.
+  %row_sum = kernel.subgroup.reduce<addf> %sum : f32
+  %row_sumsq = kernel.subgroup.reduce<addf> %sumsq : f32
+  %mean = scalar.divf<reassoc|nnan|ninf|nsz|arcp> %row_sum, %hidden_f32 : f32
+  %mean_sq = scalar.mulf<reassoc|nnan|ninf|nsz> %mean, %mean : f32
+  %mean_of_sq = scalar.divf<reassoc|nnan|ninf|nsz|arcp> %row_sumsq, %hidden_f32 : f32
+  %variance = scalar.subf<reassoc|nnan|ninf|nsz> %mean_of_sq, %mean_sq : f32
+  %biased = scalar.addf<reassoc|nnan|ninf|nsz> %variance, %epsilon : f32
+  %rstd = scalar.rsqrtf<nnan|ninf|nsz|afn> %biased : f32
+  %mean_v = vector.splat %mean : vector<4xf32>
+  %rstd_v = vector.splat %rstd : vector<4xf32>
+
+  scf.if %valid {
+    scf.for %step = [%c0 to %steps step %c1] unroll {
+      %offset = index.mul %step, %c128 : index
+      %channel = index.add %offset, %lane_base : index
+      %is0 = index.cmp eq, %step, %c0 : index
+      %is1 = index.cmp eq, %step, %c1 : index
+      %pick01 = scf.select %is1, %v1_pre, %v2_pre : vector<4xf32>
+      %values = scf.select %is0, %v0_pre, %pick01 : vector<4xf32>
+      %gamma_v = vector.load %gamma_view[%channel] : view<[%hidden_size]xf32> -> vector<4xf32>
+      %beta_v = vector.load %beta_view[%channel] : view<[%hidden_size]xf32> -> vector<4xf32>
+      %centred = vector.subf<reassoc|nnan|ninf|nsz> %values, %mean_v : vector<4xf32>
+      %scaled = vector.mulf<reassoc|nnan|ninf|nsz> %centred, %rstd_v : vector<4xf32>
+      %weighted = vector.mulf<reassoc|nnan|ninf|nsz> %scaled, %gamma_v : vector<4xf32>
+      %result = vector.addf<reassoc|nnan|ninf|nsz> %weighted, %beta_v : vector<4xf32>
+      vector.store %result, %output_view[%row, %channel] : vector<4xf32>, view<[%token_count]x[%hidden_size]xf32>
+    }
+  }
+  kernel.return
+}

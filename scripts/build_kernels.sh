@@ -136,3 +136,10 @@ for kn in 384:384 1536:384; do
   compile_exp matmul_resid_f16_wmma dinov3_matmul_resid_f16_wmma "resid_k${k}_n${n}" \
     "dinov3.matmul_resid_f16_wmma.k_size=$k" "dinov3.matmul_resid_f16_wmma.n_size=$n"
 done
+# LayerNorm with one row per wave: no LDS, no barriers, and the row stays in
+# registers between the two passes. Measured 3.3-4.7x over the per-workgroup
+# version, which needed a cross-wave reduction and a second read from global.
+compile_exp layernorm_rowwave_f16 dinov3_layernorm_rowwave_f16 layernorm_rowwave \
+  dinov3.layernorm_rowwave_f16.hidden_size=384 dinov3.layernorm_rowwave_f16.epsilon=1e-5
+compile_exp layernorm_rowwave_f32out dinov3_layernorm_rowwave_f32out layernorm_rowwave_f32out \
+  dinov3.layernorm_rowwave_f32out.hidden_size=384 dinov3.layernorm_rowwave_f32out.epsilon=1e-5
