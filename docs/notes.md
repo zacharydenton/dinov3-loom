@@ -234,3 +234,31 @@ emits the (A f16) and (C f16) matmul variants from the base kernel, and
 `tools/gen_f16_variants.py` does the same for layernorm, swiglu and flash
 attention -- so they cannot drift apart. The residual stream, the norm statistics
 and the final output stay f32.
+
+## f16 q/k/v: a negative result
+
+The same argument that made layernorm and swiglu emit f16 should apply to q/k/v:
+have the QKV projection write f16, teach rope and flash attention to read it, and
+the attention staging becomes a straight copy instead of a load-and-narrow. The
+kernels are all generated (`rope_2d_f16.loom`,
+`flash_attention_f16_wmma_af16_cf16.loom`, an f16-out QKV matmul) and compile
+clean, and accuracy holds at cosine 0.9999993.
+
+**It is slower.** Best of 4, alternating:
+
+| | f16 q/k/v | f32 q/k/v |
+| --- | ---: | ---: |
+| batch 8 | 662.4 | **769.8** |
+| batch 32 | 529.2 | **703.0** |
+
+The f16 flash-attention variant compiles to 13328 bytes against 9192 for the f32
+one, so something in the f16 path is generating substantially more code rather
+than less work -- but the measurement is consistent across batch sizes and
+repeats, so it was not worth chasing further. `--f16-qkv` keeps the path
+reachable for anyone who wants to dig; the default is off.
+
+Worth recording because the reasoning was sound and the result was not: the win
+from f16 activations came from the *read amplification* on the matmul A operand
+(48 column tiles for gate/up), and q/k/v have no such amplification -- attention
+reads them once per query tile, and rope reads them once. There was never much
+bandwidth there to save.

@@ -126,6 +126,11 @@ int main(int argc, char **argv) {
     // simpler single-tile path and the flag is here to re-measure on an idle box.
     int repeat = 1, batch = 1, wide_threshold = 1 << 30;
     bool wmma = true, flash_attn = true, f16_act = true;
+    // Carrying q/k/v as f16 through rope and attention MEASURED SLOWER -- 662 vs
+    // 770 img/s at batch 8 and 529 vs 703 at batch 32, best of 4. The kernels
+    // are generated and compile fine, so --f16-qkv keeps them reachable, but the
+    // default is off. See docs/notes.md.
+    bool f16_qkv = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -140,6 +145,7 @@ int main(int argc, char **argv) {
         else if (a == "--f32") wmma = false;
         else if (a == "--no-flash") flash_attn = false;
         else if (a == "--f32-act") f16_act = false;
+        else if (a == "--f16-qkv") f16_qkv = true;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -175,6 +181,7 @@ int main(int argc, char **argv) {
     Kernel matmul_qkvo_wide, matmul_down_wide;
     Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
+    Kernel rope16, flash16_af16, wmma_qkv16_cf16;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -201,6 +208,9 @@ int main(int argc, char **argv) {
     wmma_o16.load(kernels_dir, "wmma_af16_k384_n384", "dinov3_matmul_bias_f16_wmma_af16");
     wmma_down16.load(kernels_dir, "wmma_af16_k1536_n384", "dinov3_matmul_bias_f16_wmma_af16");
     wmma_gateup16.load(kernels_dir, "wmma_af16_cf16_k384_n3072", "dinov3_matmul_bias_f16_wmma_af16_cf16");
+    wmma_qkv16_cf16.load(kernels_dir, "wmma_af16_cf16_k384_n1152", "dinov3_matmul_bias_f16_wmma_af16_cf16");
+    rope16.load(kernels_dir, "rope_f16", "dinov3_rope_2d_f32_f16");
+    flash16_af16.load(kernels_dir, "flash_attention_af16", "dinov3_flash_attention_f16_wmma_cf16_af16");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -209,6 +219,8 @@ int main(int argc, char **argv) {
     // compute-to-LDS ratio wins again.
     // Activations that only feed a matmul are carried as f16.
     const bool narrow_act = wmma && f16_act;
+    // q/k/v carried as f16 through rope and attention as well.
+    const bool narrow_qkv = narrow_act && f16_qkv;
     const bool wide_narrow_n = rows >= wide_threshold;
     Kernel &proj_kernel = wide_narrow_n ? matmul_qkvo_wide : matmul_qkvo;
     Kernel &down_kernel = wide_narrow_n ? matmul_down_wide : matmul_down;
@@ -222,7 +234,10 @@ int main(int argc, char **argv) {
     alloc(&gate, size_t(rows) * GATEUP);
     alloc(&act, size_t(rows) * INTERMEDIATE);  alloc(&out, size_t(rows) * HIDDEN);
     alloc(&patched, size_t(patch_rows) * HIDDEN);
-    k = q + HIDDEN; v = q + 2 * HIDDEN;
+    // q/k/v are f16 under narrow_act, so the head offsets are half as many
+    // float-sized steps.
+    const int qkv_step = (wmma && f16_act && f16_qkv) ? HIDDEN / 2 : HIDDEN;
+    k = q + qkv_step; v = q + 2 * qkv_step;
     // When gate/up is f16 the two halves are INTERMEDIATE f16 apart, which is
     // half as many float-sized steps.
     up = (wmma && f16_act) ? gate + INTERMEDIATE / 2 : gate + INTERMEDIATE;
@@ -268,22 +283,23 @@ int main(int argc, char **argv) {
             std::string p = "l" + std::to_string(layer) + "_";
             { Stage stage("layernorm"); norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h, narrow_act); }
             { Stage stage("qkv matmul");
-              matmul(narrow_act ? wmma_qkv16 : (wmma ? wmma_qkv : matmul_qkv), rows, QKV, h,
-                     PW(p + "qkv_w"), W(p + "qkv_b"), q); }
+              matmul(narrow_qkv ? wmma_qkv16_cf16
+                                : (narrow_act ? wmma_qkv16 : (wmma ? wmma_qkv : matmul_qkv)),
+                     rows, QKV, h, PW(p + "qkv_w"), W(p + "qkv_b"), q); }
 
             { Stage stage("rope");
             for (float *target : {q, k}) {
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(target); args.pointer(W("rope_cos")); args.pointer(W("rope_sin"));
-                launch(rope.function, rows, 1, args);
+                launch(narrow_qkv ? rope16.function : rope.function, rows, 1, args);
             } }
             { Stage stage("attention");
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
                 if (wmma && flash_attn) {
-                    Kernel &fa = narrow_act ? flash16 : flash;
+                    Kernel &fa = narrow_qkv ? flash16_af16 : (narrow_act ? flash16 : flash);
                     // One workgroup per (16 query rows within an image, head).
                     launch(fa.function, batch * ((TOKENS + 15) / 16), HEADS, args);
                 } else {

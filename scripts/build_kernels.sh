@@ -72,5 +72,17 @@ for kn in 384:1152 384:384 1536:384; do
   compile matmul_bias_f16_wmma_af16 dinov3_matmul_bias_f16_wmma_af16 "wmma_af16_k${k}_n${n}" \
     "dinov3.matmul_bias_f16_wmma_af16.k_size=$k" "dinov3.matmul_bias_f16_wmma_af16.n_size=$n"
 done
-compile matmul_bias_f16_wmma_af16_cf16 dinov3_matmul_bias_f16_wmma_af16_cf16 wmma_af16_cf16_k384_n3072 \
-  dinov3.matmul_bias_f16_wmma_af16_cf16.k_size=384 dinov3.matmul_bias_f16_wmma_af16_cf16.n_size=3072
+for kn in 384:3072 384:1152; do
+  k="${kn%%:*}"; n="${kn##*:}"
+  compile matmul_bias_f16_wmma_af16_cf16 dinov3_matmul_bias_f16_wmma_af16_cf16 "wmma_af16_cf16_k${k}_n${n}" \
+    "dinov3.matmul_bias_f16_wmma_af16_cf16.k_size=$k" "dinov3.matmul_bias_f16_wmma_af16_cf16.n_size=$n"
+done
+compile rope_2d_f16 dinov3_rope_2d_f32_f16 rope_f16 \
+  dinov3.rope_2d_f32_f16.hidden_size=384 dinov3.rope_2d_f32_f16.head_dim=64 \
+  dinov3.rope_2d_f32_f16.prefix=5 dinov3.rope_2d_f32_f16.row_stride=1152 \
+  dinov3.rope_2d_f32_f16.tokens_per_image=201
+compile flash_attention_f16_wmma_af16_cf16 dinov3_flash_attention_f16_wmma_cf16_af16 flash_attention_af16 \
+  dinov3.flash_attention_f16_wmma_cf16_af16.hidden_size=384 \
+  dinov3.flash_attention_f16_wmma_cf16_af16.qkv_stride=1152 \
+  dinov3.flash_attention_f16_wmma_cf16_af16.tokens_per_image=201 \
+  dinov3.flash_attention_f16_wmma_cf16_af16.scale=0.125
