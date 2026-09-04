@@ -27,19 +27,80 @@ dimensions, but S+ uses `use_gated_mlp: true` with SiLU where S uses plain GELU.
 
 ## Status
 
-| kernel | state | notes |
-| --- | --- | --- |
-| `layernorm_f32` | **working, validated** | max_abs 1.6e-6, cosine 1.0000000000 vs f64 NumPy; 14.3 µs at 201×384 |
-| matmul + bias | not started | ggml-hrx's `mul_mat_*_wmma` corpus is the starting point |
-| flash attention | not started | ditto `flash_attention_f32_f16_wmma` |
-| RoPE (2D axial) | not started | ggml's `rope_f32` is 1D; DINOv3 needs axial |
-| SwiGLU MLP | not started | `mul_mat_swiglu_f32_f32_wmma` exists in the corpus |
-| LayerScale + residual | not started | trivial once binary/unary are wired |
-| patch embed | not started | 16×16 stride 16 is a reshape + matmul, no conv needed |
-| end-to-end runner | not started | |
+Complete forward pass, validated, benchmarked. Six kernels:
 
-LayerNorm came first because it is the one op in a DINOv3 forward pass that
-ggml-hrx's kernel corpus does **not** cover — it ships RMSNorm only.
+| kernel | what |
+| --- | --- |
+| `layernorm_f32` | LayerNorm over the last dim; the one DINOv3 op ggml-hrx's corpus lacks |
+| `matmul_bias_f32` | `C = A @ W^T + bias`, W row-major `[N, K]` — a torch `nn.Linear` weight verbatim. 64x64 tile, 4x4 register micro-tile |
+| `matmul_bias_f32_narrow` | same, 64x32 tile, for the N=384 projections that cannot fill 40 CUs at 64 wide |
+| `rope_2d_f32` | DINOv3 axial RoPE, patch tokens only, race-free in place |
+| `attention_f32` | one workgroup per (token, head); two-stage LDS softmax |
+| `swiglu_f32` | `silu(gate) * up` — the "+" in ViT-S+ |
+| `residual_scale_f32` | LayerScale and residual fused, in place on the stream |
+
+`host/dinov3` chains them into the 12-layer model: 170 launches per image,
+weights uploaded once, patch extraction on the host (16x16 stride 16 is a pure
+reshape). All nine kernel configurations compile in **106 ms total**.
+
+## Correctness
+
+`tools/validate.py` runs the model against HF transformers on three images:
+
+```
+  PASS image 0: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=2.81e-05
+  PASS image 1: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=2.81e-05
+  PASS image 2: cosine full=1.0000000000 cls=1.0000000000 mean-patch=1.0000000000 max_abs=4.26e-05
+```
+
+For scale: xdna-vision gates DINOv3 at cosine > 0.997.
+
+`tools/reference.py` is an independent float64 NumPy implementation of the whole
+architecture, agreeing with transformers to 9.3e-06. Every individual kernel is
+graded against it, not against torch, so a kernel bug cannot hide behind a
+matching bug in the harness.
+
+## Benchmark
+
+Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 5 interleaved rounds
+(`tools/benchmark.py`). The machine had other jobs on it; interleaving means
+both sides saw the same contention.
+
+| configuration | img/s | vs Loom |
+| --- | ---: | ---: |
+| torch max-autotune fp16, batch 64 | 857.9 | 7.07x |
+| torch compile fp16, batch 64 | 712.3 | 5.87x |
+| torch eager fp16, batch 64 | 513.9 | 4.23x |
+| torch max-autotune fp16, batch 1 | 473.7 | 3.90x |
+| torch compile fp16, batch 1 | 247.6 | 2.04x |
+| torch eager fp16, batch 1 | 178.7 | 1.47x |
+| torch max-autotune fp32, batch 64 | 159.7 | 1.32x |
+| torch compile fp32, batch 64 | 136.8 | 1.13x |
+| **loom fp32, batch 1** | **121.4** | **1.00x** |
+| torch eager fp32, batch 1 | 115.3 | 0.95x |
+| torch eager fp32, batch 64 | 114.4 | 0.94x |
+| torch max-autotune fp32, batch 1 | 82.0 | 0.68x |
+| torch compile fp32, batch 1 | 75.5 | 0.62x |
+
+Read it honestly:
+
+- **At fp32 batch 1 the Loom path wins**, beating every torch fp32 batch-1
+  configuration including `max-autotune`, and it beats torch fp32 at batch 64
+  while itself running one image at a time.
+- **fp16 torch is 4-7x ahead**, and that gap is the whole remaining story. Those
+  paths reach WMMA through hipBLASLt and Triton; these kernels are scalar f32
+  FMA and cannot. Closing it means f16 inputs with f32 accumulation through
+  Loom's `vector.mma`, which is what ggml-hrx's own corpus does. That is the
+  next kernel, not a tuning pass.
+- **`torch.compile` is a pessimisation at fp32 batch 1** here (75.5 and 82.0 vs
+  eager's 115.3). Only batching pays it back.
+- **max-autotune did not fail on ViT-S+**, unlike the ViT-L result recorded
+  earlier: it compiled and ran in every configuration. The 96 KB LDS request
+  that breaks it at ViT-L does not arise at head_dim 64 with 201 tokens.
+
+Getting from the first working version to here was 22 -> 46 -> 80 -> 94 -> 121
+img/s; `docs/notes.md` has what each step was worth. The single largest change
+was padding an LDS row stride from 32 to 33 floats.
 
 ## Layout
 
@@ -55,17 +116,21 @@ docs/       notes.md — the compiler and ABI landmines found so far
 
 ```console
 $ source scripts/env.sh
+$ python3 tools/export_weights.py          # 115 MB blob + manifest
+$ ./scripts/build_kernels.sh               # nine HSACOs, ~106 ms
+$ /opt/rocm/bin/hipcc -O2 -o host/dinov3 host/dinov3.cpp
 $ /opt/rocm/bin/hipcc -O2 -o host/loomrun host/loomrun.cpp
-$ python3 tools/test_layernorm.py
-compiled layernorm_f32 for hidden=384
-  PASS tokens=1     ( 130.83 us): max_abs=5.311e-07 max_rel=2.349e-05 cosine=1.00000000
-  PASS tokens=3     ( 161.44 us): max_abs=7.566e-07 max_rel=1.654e-05 cosine=1.00000000
-  PASS tokens=201   (  14.34 us): max_abs=1.632e-06 max_rel=8.170e-04 cosine=1.00000000
-  PASS tokens=1024  (  41.96 us): max_abs=1.520e-06 max_rel=1.243e-02 cosine=1.00000000
+
+$ python3 tools/validate.py                # vs HF transformers
+$ python3 tools/benchmark.py               # vs torch, interleaved
+$ ./host/dinov3 --input build/patchified.bin --repeat 30
+{"images": 30, "total_ms": 319.304, "ms_per_image": 10.643, "img_per_s": 93.95}
+$ ./host/dinov3 --input build/patchified.bin --repeat 15 --profile
 ```
 
-(`max_rel` blows up only where the expected value passes through zero; cosine
-similarity is 1.0 to ten digits in every case.)
+Per-kernel tests go through `host/loomrun`, which launches one compiled HSACO
+and dumps its buffers: `python3 tools/test_matmul.py`, `tools/test_layernorm.py`,
+`tools/test_kernels.py`. Each compares against float64 NumPy.
 
 Prerequisites: a built `hrx-system` (`$HRX_BUILD`, default `~/code/hrx-system/build-cuda`)
 and a working ROCm. On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts
