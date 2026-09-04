@@ -162,6 +162,9 @@ int main(int argc, char **argv) {
     // everywhere. (A standalone harness said 0.64x at batch 1; the in-model
     // measurement disagrees and is the one that counts.)
     int qkv_rope_rows = 0;
+    // Fold the residual add and LayerScale into the o/down epilogue, which
+    // removes the branch tensor and leaves a plain LayerNorm behind.
+    bool fuse_resid = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -184,6 +187,7 @@ int main(int argc, char **argv) {
         else if (a == "--f32-branch") f16_branch = false;
         else if (a == "--splitk-rows") splitk_rows = std::stoi(next());
         else if (a == "--qkv-rope-rows") qkv_rope_rows = std::stoi(next());
+        else if (a == "--no-fuse-resid") fuse_resid = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -221,7 +225,7 @@ int main(int argc, char **argv) {
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
     Kernel attn_online, wmma_o16_cf16, wmma_down16_cf16, residual_norm16, residual16;
-    Kernel splitk_down, splitk_reduce, qkv_rope;
+    Kernel splitk_down, splitk_reduce, qkv_rope, resid_o, resid_down;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -261,6 +265,8 @@ int main(int argc, char **argv) {
     splitk_down.load(kernels_dir, "splitk_k1536_n384", "dinov3_matmul_splitk_f16_wmma");
     splitk_reduce.load(kernels_dir, "splitk_reduce_n384", "dinov3_splitk_reduce_f16");
     qkv_rope.load(kernels_dir, "qkv_rope_k384_n1152", "dinov3_matmul_qkv_rope_f16_wmma");
+    resid_o.load(kernels_dir, "resid_k384_n384", "dinov3_matmul_resid_f16_wmma");
+    resid_down.load(kernels_dir, "resid_k1536_n384", "dinov3_matmul_resid_f16_wmma");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -275,6 +281,9 @@ int main(int argc, char **argv) {
     const int SPLITS = 4;
     const bool use_splitk = narrow_branch && rows <= splitk_rows;
     const bool use_qkv_rope = narrow_qkv && rows >= qkv_rope_rows;
+    // The split-K down path writes partials, so its residual add would have
+    // to live in the reduction instead; keep the old path there for now.
+    const bool use_resid = narrow_branch && fuse_resid && fuse_norm && !use_splitk;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
     const bool fused_swiglu = narrow_act && fuse_swiglu;
@@ -316,6 +325,15 @@ int main(int argc, char **argv) {
         args.scalar_i32(m);
         args.pointer(a); args.pointer(w); args.pointer(bias); args.pointer(c);
         launch(kernel.function, n / tile_n, (m + TILE - 1) / TILE, args);
+    };
+    // A@W + bias scaled by lambda and accumulated into the residual stream.
+    auto matmul_resid = [&](Kernel &kernel, int m, int n, const float *a, const void *w,
+                            const float *bias, float *stream, const float *lambda) {
+        KernArgs args;
+        args.scalar_i32(m);
+        args.pointer(a); args.pointer(w); args.pointer(bias);
+        args.pointer(stream); args.pointer(lambda);
+        launch(kernel.function, n / TILE, (m + TILE - 1) / TILE, args);
     };
     // `dst` is f16 when narrow_act, so callers treat it as opaque.
     auto norm = [&](const float *in, const float *gamma, const float *beta, void *dst,
@@ -399,12 +417,20 @@ int main(int argc, char **argv) {
                     launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
                 }
             }
+            if (use_resid) {
+                { Stage stage("o matmul+resid");
+                  matmul_resid(resid_o, rows, HIDDEN, attn, PW(p + "o_w"), W(p + "o_b"),
+                               x, W(p + "ls1")); }
+                { Stage stage("layernorm");
+                  norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h, narrow_act); }
+            } else
             { Stage stage("o matmul");
               matmul(narrow_branch ? wmma_o16_cf16
                                    : ((narrow_act && flash_attn) ? wmma_o16 : (wmma ? wmma_o : proj_kernel)),
                      rows, HIDDEN, attn, PW(p + "o_w"), W(p + "o_b"), proj,
                      wmma ? TILE : narrow_tile); }
-            if (fused_norm) {
+            if (use_resid) {
+            } else if (fused_norm) {
                 Stage stage("residual+norm");
                 residual_norm_fused(x, proj, W(p + "ls1"), W(p + "norm2_w"), W(p + "norm2_b"), h);
             } else {
@@ -449,13 +475,24 @@ int main(int argc, char **argv) {
                 red.scalar_i32(rows);
                 red.pointer(partials); red.pointer(W(p + "down_b")); red.pointer(mlp);
                 launch(splitk_reduce.function, rows, 1, red);
+            } else if (use_resid) {
+                { Stage stage("down matmul+resid");
+                  matmul_resid(resid_down, rows, HIDDEN, act, PW(p + "down_w"),
+                               W(p + "down_b"), x, W(p + "ls2")); }
+                if (layer + 1 < LAYERS) {
+                    // Pairs with the *next* layer's norm1.
+                    std::string next = "l" + std::to_string(layer + 1) + "_";
+                    Stage stage("layernorm");
+                    norm(x, W(next + "norm1_w"), W(next + "norm1_b"), h, narrow_act);
+                }
             } else
             { Stage stage("down matmul");
               matmul(narrow_branch ? wmma_down16_cf16
                                    : (narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel)),
                      rows, HIDDEN, act, PW(p + "down_w"), W(p + "down_b"), mlp,
                      wmma ? TILE : narrow_tile); }
-            if (fused_norm && layer + 1 < LAYERS) {
+            if (use_resid) {
+            } else if (fused_norm && layer + 1 < LAYERS) {
                 // Pairs with the *next* layer's norm1.
                 std::string next = "l" + std::to_string(layer + 1) + "_";
                 Stage stage("residual+norm");

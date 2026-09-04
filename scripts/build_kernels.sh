@@ -129,3 +129,10 @@ compile_exp matmul_qkv_rope_f16_wmma dinov3_matmul_qkv_rope_f16_wmma qkv_rope_k3
   dinov3.matmul_qkv_rope_f16_wmma.head_dim=64 dinov3.matmul_qkv_rope_f16_wmma.prefix=5 \
   dinov3.matmul_qkv_rope_f16_wmma.tokens_per_image=201 \
   dinov3.matmul_qkv_rope_f16_wmma.rope_channels=768
+# o / down projections with the residual add and LayerScale in the epilogue,
+# which removes the branch tensor and leaves a plain LayerNorm behind.
+for kn in 384:384 1536:384; do
+  k="${kn%%:*}"; n="${kn##*:}"
+  compile_exp matmul_resid_f16_wmma dinov3_matmul_resid_f16_wmma "resid_k${k}_n${n}" \
+    "dinov3.matmul_resid_f16_wmma.k_size=$k" "dinov3.matmul_resid_f16_wmma.n_size=$n"
+done
