@@ -391,3 +391,56 @@ way. The changes that won -- LDS padding, operand fusion, f16 activations,
 SwiGLU as an epilogue -- all removed work or traffic without spending registers
 or LDS. The one apparent exception, the dual-N SwiGLU matmul, spends both but
 deletes an entire pass in exchange.
+
+## Lever 5: the online-softmax attention port -- written, blocked on the compiler
+
+`experiments/attention_online_f16_wmma.loom` is a complete port of
+`hrx-demos/kernels/ideogram4/attention_online_bf16_wmma.loom` to DINOv3's
+head_dim of 64: one wave32 per (16 query rows, head), 512 bytes of LDS used only
+to reinterpret an f32 score fragment as an f16 `lhs`, K and V fragment-loaded
+straight from global with K transposed by a strided view, and eight loop-carried
+`vector<8xf32>` values -- running max and sum split across the two lane groups,
+plus four accumulators for the 64 output channels.
+
+**It does not lower on the HRX revision this repo is pinned to.** Both global
+fragment loads are rejected with:
+
+```
+source-to-low constraint 'fragment_memory.dynamic_stride' is not satisfied
+```
+
+That is not a stride problem in the ordinary sense. Bisected against a minimal
+no-LDS matmul, all of these compile fine on the same revision:
+
+| probe | result |
+| --- | --- |
+| global `lhs`/`rhs` fragment loads, dense view, runtime extent | compiles |
+| view stride 1152 wider than the 384 columns actually read | compiles |
+| transposed `rhs` via `encoding.layout.strided [1, k]` | compiles |
+| compile-time-constant view extent | only a bounds error, fixable |
+
+And none of these fix the attention kernel: raw config values instead of
+`index.assume`d ones, dense views for q and v, a static `token_capacity` extent,
+`mul(...,16)` proofs on the channel and on the tile origins, dropping `unroll`,
+or targeting `gfx1100` the way hrx-demos does.
+
+The likely reason is the revision. `hrx-demos` pins hrx-system at
+`13420558bb` (**15 July 2026**), which is *older* than this repo's `c9855b47e`
+(3 September). The constraint was tightened in between, so a technique that is
+load-bearing for every kernel in `hrx-demos` may simply not be expressible on
+current HRX in this form. Trying to confirm that by building `loom-compile` at
+their revision failed too: it does not configure under CMake at all
+(`iree_package_ns(): Could not determine package for experimental/id4/ideogram4`)
+because `hrx-demos` builds with Bazel.
+
+So the next step is not more kernel work. It is either:
+
+1. build the July revision through Bazel (`python dev.py setup --release` in
+   `hrx-demos`, which vendors its own hrx-system) and compile the ported kernel
+   there, to confirm the technique works and measure what it is worth; or
+2. find what replaced it on current HRX -- there may be a newer spelling for a
+   global fragment load that satisfies the constraint, and `loom-lint` or the
+   `hrx-loom-kernels` contribution gates may document it.
+
+Until one of those is answered, the 5x on attention identified in
+`docs/path-to-1300.md` is blocked on the toolchain rather than on the kernel.

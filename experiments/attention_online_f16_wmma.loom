@@ -1,0 +1,272 @@
+// Online-softmax attention: one wave32 per (16 query rows, head).
+//
+// Ported from ROCm/hrx-demos `kernels/ideogram4/attention_online_bf16_wmma.loom`,
+// adapted from head_size 256 to DINOv3's 64.
+//
+// The point of this shape is what it does *not* do. K and V are never staged in
+// LDS: both fragments load straight from global, with K's transpose expressed as
+// a strided view rather than a copy. The workgroup is a single wave, so there is
+// no cross-wave synchronisation to pay for. The only LDS is 512 bytes used to
+// turn an f32 score fragment into an f16 `lhs` fragment for P*V.
+//
+// Everything else lives in registers across the whole key loop: a running max
+// and sum (split across the two lane groups that own different fragment rows)
+// plus four 16x16 accumulators for the 64 output channels.
+//
+// q, k and v are f16 with a shared row stride, so they can be three pointers
+// into one fused QKV projection output. Their buffers must have 16 rows of
+// headroom: a query tile may span an image boundary, and the overhanging rows
+// are masked rather than avoided.
+
+amdgpu.target<gfx11-generic> @dinov3_attention_online_gfx11 {subgroup_size = 32}
+
+config.decl @dinov3.attention_online_f16_wmma.hidden_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.attention_online_f16_wmma.qkv_stride : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
+
+config.decl @dinov3.attention_online_f16_wmma.tokens_per_image : %value: index where [range(%value, 16, 8192)]
+
+config.decl @dinov3.attention_online_f16_wmma.scale : f32
+
+// View extent for q/k/v. Only used for bounds proofs -- every access is guarded
+// against the real token count -- but it must be a compile-time constant or the
+// fragment load reports a dynamic stride and will not lower.
+config.decl @dinov3.attention_online_f16_wmma.token_capacity : %value: index where [range(%value, 16, 1048576), mul(%value, 16)]
+
+kernel.def target(@dinov3_attention_online_gfx11) export("dinov3_attention_online_f16_wmma") @dinov3_attention_online_f16_wmma(%token_count: index, %head_count: index) {
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %tokens_per_image0 = config.get @dinov3.attention_online_f16_wmma.tokens_per_image : index
+  %rounded = index.add %tokens_per_image0, %c15 : index
+  %tiles_per_image = index.div %rounded, %c16 : index
+  %images = index.div %token_count, %tokens_per_image0 : index
+  %tiles = index.mul %images, %tiles_per_image : index
+  kernel.launch.config workgroups(%tiles, %head_count, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer) {
+  %hidden_size0 = config.get @dinov3.attention_online_f16_wmma.hidden_size : index
+  %qkv_stride0 = config.get @dinov3.attention_online_f16_wmma.qkv_stride : index
+  %tokens_per_image0 = config.get @dinov3.attention_online_f16_wmma.tokens_per_image : index
+  %scale = config.get @dinov3.attention_online_f16_wmma.scale : f32
+  %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 64, 8192), mul(%hidden_size0, 64)] : index
+  %qkv_stride = index.assume %qkv_stride0 [range(%qkv_stride0, 64, 32768), mul(%qkv_stride0, 64)] : index
+  %tokens_per_image = index.assume %tokens_per_image0 [range(%tokens_per_image0, 16, 8192)] : index
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c48 = index.constant 48 : index
+  %c64 = index.constant 64 : index
+  %c0_offset = index.constant 0 : offset
+  %scratch_bytes = index.constant 512 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k_frag = index.constant 16 : index
+  %zero_f32 = scalar.constant 0.0 : f32
+  %negative_large = scalar.constant -1000000000.0 : f32
+  %zero_acc = vector.constant 0.0 : vector<8xf32>
+  %zero_vector = vector.splat %zero_f32 : vector<8xf32>
+  %negative_vector = vector.splat %negative_large : vector<8xf32>
+  %scale_vector = vector.splat %scale : vector<8xf32>
+
+  %tile_id = kernel.workgroup.id<x> : index
+  %head = kernel.workgroup.id<y> : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane_column = index.rem %lane, %c16 : index
+  %lane_group = index.div %lane, %c16 : index
+  %lane_group_even = index.cmp eq, %lane_group, %c0 : index
+
+  %rounded = index.add %tokens_per_image, %c15 : index
+  %tiles_per_image = index.div %rounded, %c16 : index
+  %image = index.div %tile_id, %tiles_per_image : index
+  %tile_in_image = index.rem %tile_id, %tiles_per_image : index
+  %image_base = index.mul %image, %tokens_per_image : index
+  %local_query_origin = index.mul %tile_in_image, %c16 : index
+  %query_origin0 = index.add %image_base, %local_query_origin : index
+  %head_base0 = index.mul %head, %c64 : index
+  %channel_limit = index.sub %hidden_size, %c64 : index
+  %head_base = index.assume %head_base0 [le(%head_base0, %channel_limit)] : index
+
+  // Every tile origin is below token_count, and the caller keeps token_count at
+  // least 16 below token_capacity, so a whole tile always fits inside the view.
+  %padded_tokens = config.get @dinov3.attention_online_f16_wmma.token_capacity : index
+  %tile_origin_limit = index.sub %padded_tokens, %c16 : index
+  %query_origin = index.assume %query_origin0 [le(%query_origin0, %tile_origin_limit)] : index
+  %q_global = buffer.assume.memory_space<global> %q : buffer
+  %k_global = buffer.assume.memory_space<global> %k : buffer
+  %v_global = buffer.assume.memory_space<global> %v : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %q_aligned = buffer.assume.alignment %q_global {minimum_alignment = 16} : buffer
+  %k_aligned = buffer.assume.alignment %k_global {minimum_alignment = 16} : buffer
+  %v_aligned = buffer.assume.alignment %v_global {minimum_alignment = 16} : buffer
+
+  // Tiles may overhang the end by up to 15 rows, so the views are declared over
+  // token_count + 16. The caller allocates that headroom; the overhanging rows
+  // are masked, never avoided.
+  // q and v are viewed densely over the *full* qkv row, and the head channel is
+  // indexed directly. A strided row layout on an lhs fragment load is rejected;
+  // only the transposed K view needs one, which is what hrx-demos does too.
+  // The raw config value is used, since routing it through index.assume first
+  // hides the compile-time constant and the stride is then reported dynamic.
+  %transposed_layout = encoding.layout.strided [1, %qkv_stride0] : encoding<layout>
+  %q_view = buffer.view %q_aligned[%c0_offset] : buffer -> view<[%padded_tokens]x[%qkv_stride0]xf16>
+  %k_transposed = buffer.view %k_aligned[%c0_offset] : buffer -> view<[%qkv_stride0]x[%padded_tokens]xf16, %transposed_layout>
+  %v_view = buffer.view %v_aligned[%c0_offset] : buffer -> view<[%padded_tokens]x[%qkv_stride0]xf16>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+
+  %scratch = buffer.alloca<workgroup> align(16) %scratch_bytes : buffer
+  %scratch_view = buffer.view %scratch[%c0_offset] : buffer -> view<16x16xf16>
+  %result_bytes = index.constant 4096 : offset
+  %result_stage = buffer.alloca<workgroup> align(16) %result_bytes : buffer
+  %result_view = buffer.view %result_stage[%c0_offset] : buffer -> view<16x64xf32>
+
+  %init = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
+  %key_tile_count = index.add %tiles_per_image, %c0 : index
+
+  %final_max_even, %final_sum_even, %final_max_odd, %final_sum_odd, %final0, %final1, %final2, %final3 = scf.for %key_tile = [%c0 to %key_tile_count step %c1](%max_even = %negative_vector : vector<8xf32>, %sum_even = %zero_vector : vector<8xf32>, %max_odd = %negative_vector : vector<8xf32>, %sum_odd = %zero_vector : vector<8xf32>, %acc0 = %init : vector<8xf32>, %acc1 = %init : vector<8xf32>, %acc2 = %init : vector<8xf32>, %acc3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+    %local_key_origin = index.mul %key_tile, %c16 : index
+    %key_origin0 = index.add %image_base, %local_key_origin : index
+    %key_origin = index.assume %key_origin0 [le(%key_origin0, %tile_origin_limit)] : index
+    %local_key = index.add %local_key_origin, %lane_column : index
+    %key_valid = index.cmp ult, %local_key, %tokens_per_image : index
+
+    %raw_scores = scf.for %head_tile = [%c0 to %c64 step %c16](%qk = %init : vector<8xf32>) -> (vector<8xf32>) unroll {
+      %channel = index.add %head_base, %head_tile : index
+      %lhs = vector.fragment.load<lhs> %q_view[%query_origin, %channel] shape [%m, %k_frag] : view<[%padded_tokens]x[%qkv_stride0]xf16> -> vector<16xf16>
+      %rhs = vector.fragment.load<rhs> %k_transposed[%channel, %key_origin] shape [%k_frag, %n] : view<[%qkv_stride0]x[%padded_tokens]xf16, %transposed_layout> -> vector<16xf16>
+      %next = vector.mma %lhs, %rhs, %qk : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %next : vector<8xf32>
+    }
+    %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %scale_vector : vector<8xf32>
+    %scaled = scf.if %key_valid -> (vector<8xf32>) {
+      scf.yield %scaled0 : vector<8xf32>
+    } else {
+      scf.yield %negative_vector : vector<8xf32>
+    }
+
+    // The two lane groups own different fragment rows, so the running statistics
+    // are reduced separately and selected by group.
+    %even_scores = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %scaled : vector<8xf32>
+    } else {
+      scf.yield %negative_vector : vector<8xf32>
+    }
+    %odd_scores = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %negative_vector : vector<8xf32>
+    } else {
+      scf.yield %scaled : vector<8xf32>
+    }
+    %tile_max_even = kernel.workgroup.reduce<maxnumf> %even_scores : vector<8xf32>
+    %tile_max_odd = kernel.workgroup.reduce<maxnumf> %odd_scores : vector<8xf32>
+    %next_max_even = vector.maxnumf %max_even, %tile_max_even : vector<8xf32>
+    %next_max_odd = vector.maxnumf %max_odd, %tile_max_odd : vector<8xf32>
+    %selected_max = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %next_max_even : vector<8xf32>
+    } else {
+      scf.yield %next_max_odd : vector<8xf32>
+    }
+
+    %delta = vector.subf<reassoc|nnan|ninf|nsz> %scaled, %selected_max : vector<8xf32>
+    %raw_weight = vector.expf<afn> %delta : vector<8xf32>
+    %weight = scf.if %key_valid -> (vector<8xf32>) {
+      scf.yield %raw_weight : vector<8xf32>
+    } else {
+      scf.yield %zero_vector : vector<8xf32>
+    }
+    %even_weight = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %weight : vector<8xf32>
+    } else {
+      scf.yield %zero_vector : vector<8xf32>
+    }
+    %odd_weight = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %zero_vector : vector<8xf32>
+    } else {
+      scf.yield %weight : vector<8xf32>
+    }
+    %tile_sum_even = kernel.workgroup.reduce<addf> %even_weight : vector<8xf32>
+    %tile_sum_odd = kernel.workgroup.reduce<addf> %odd_weight : vector<8xf32>
+
+    %old_delta_even = vector.subf<reassoc|nnan|ninf|nsz> %max_even, %next_max_even : vector<8xf32>
+    %old_delta_odd = vector.subf<reassoc|nnan|ninf|nsz> %max_odd, %next_max_odd : vector<8xf32>
+    %old_scale_even = vector.expf<afn> %old_delta_even : vector<8xf32>
+    %old_scale_odd = vector.expf<afn> %old_delta_odd : vector<8xf32>
+    %scaled_sum_even = vector.mulf<reassoc|nnan|ninf|nsz|contract> %sum_even, %old_scale_even : vector<8xf32>
+    %scaled_sum_odd = vector.mulf<reassoc|nnan|ninf|nsz|contract> %sum_odd, %old_scale_odd : vector<8xf32>
+    %next_sum_even = vector.addf<reassoc|nnan|ninf|nsz> %scaled_sum_even, %tile_sum_even : vector<8xf32>
+    %next_sum_odd = vector.addf<reassoc|nnan|ninf|nsz> %scaled_sum_odd, %tile_sum_odd : vector<8xf32>
+    %selected_old_scale = scf.if %lane_group_even -> (vector<8xf32>) {
+      scf.yield %old_scale_even : vector<8xf32>
+    } else {
+      scf.yield %old_scale_odd : vector<8xf32>
+    }
+
+    // 512 bytes of LDS, purely to reinterpret an f32 result fragment as an f16
+    // lhs fragment. This is the only synchronisation in the kernel.
+    vector.fragment.store<result> %weight, %scratch_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x16xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %probability = vector.fragment.load<lhs> %scratch_view[%c0, %c0] shape [%m, %k_frag] : view<16x16xf16> -> vector<16xf16>
+
+    %channel0 = index.add %head_base, %c0 : index
+    %channel1 = index.add %head_base, %c16 : index
+    %channel2 = index.add %head_base, %c32 : index
+    %channel3 = index.add %head_base, %c48 : index
+    %v0 = vector.fragment.load<rhs> %v_view[%key_origin, %channel0] shape [%k_frag, %n] : view<[%padded_tokens]x[%qkv_stride0]xf16> -> vector<16xf16>
+    %v1 = vector.fragment.load<rhs> %v_view[%key_origin, %channel1] shape [%k_frag, %n] : view<[%padded_tokens]x[%qkv_stride0]xf16> -> vector<16xf16>
+    %v2 = vector.fragment.load<rhs> %v_view[%key_origin, %channel2] shape [%k_frag, %n] : view<[%padded_tokens]x[%qkv_stride0]xf16> -> vector<16xf16>
+    %v3 = vector.fragment.load<rhs> %v_view[%key_origin, %channel3] shape [%k_frag, %n] : view<[%padded_tokens]x[%qkv_stride0]xf16> -> vector<16xf16>
+    %rescaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc0, %selected_old_scale : vector<8xf32>
+    %rescaled1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc1, %selected_old_scale : vector<8xf32>
+    %rescaled2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc2, %selected_old_scale : vector<8xf32>
+    %rescaled3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc3, %selected_old_scale : vector<8xf32>
+    %next0 = vector.mma %probability, %v0, %rescaled0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next1 = vector.mma %probability, %v1, %rescaled1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next2 = vector.mma %probability, %v2, %rescaled2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next3 = vector.mma %probability, %v3, %rescaled3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next_max_even, %next_sum_even, %next_max_odd, %next_sum_odd, %next0, %next1, %next2, %next3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  %selected_sum = scf.if %lane_group_even -> (vector<8xf32>) {
+    scf.yield %final_sum_even : vector<8xf32>
+  } else {
+    scf.yield %final_sum_odd : vector<8xf32>
+  }
+  %out0 = vector.divf<nnan|ninf|nsz|arcp> %final0, %selected_sum : vector<8xf32>
+  %out1 = vector.divf<nnan|ninf|nsz|arcp> %final1, %selected_sum : vector<8xf32>
+  %out2 = vector.divf<nnan|ninf|nsz|arcp> %final2, %selected_sum : vector<8xf32>
+  %out3 = vector.divf<nnan|ninf|nsz|arcp> %final3, %selected_sum : vector<8xf32>
+  vector.fragment.store<result> %out0, %result_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
+  vector.fragment.store<result> %out1, %result_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
+  vector.fragment.store<result> %out2, %result_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
+  vector.fragment.store<result> %out3, %result_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  // 16 rows x 64 channels is 256 vector4s over 32 lanes: eight each, with the
+  // rows that ran past this image's tokens dropped.
+  %hidden_vector_limit = index.sub %hidden_size, %c4 : index
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %slot_base = index.mul %step, %c32 : index
+    %slot = index.add %slot_base, %lane : index
+    %row = index.div %slot, %c16 : index
+    %column_group = index.rem %slot, %c16 : index
+    %column = index.mul %column_group, %c4 : index
+    %local_row = index.add %local_query_origin, %row : index
+    %present = index.cmp ult, %local_row, %tokens_per_image : index
+    %global_row0 = index.add %image_base, %local_row : index
+    %in_range = index.cmp ult, %global_row0, %token_count : index
+    %writes = scalar.andi %present, %in_range : i1
+    scf.if %writes {
+      %global_row = index.assume %global_row0 [lt(%global_row0, %token_count)] : index
+      %values = vector.load %result_view[%row, %column] : view<16x64xf32> -> vector<4xf32>
+      %out_column0 = index.add %head_base, %column : index
+      %out_column = index.assume %out_column0 [le(%out_column0, %hidden_vector_limit)] : index
+      vector.store %values, %out_view[%global_row, %out_column] : vector<4xf32>, view<[%token_count]x[%hidden_size]xf32>
+    }
+  }
+  kernel.return
+}
