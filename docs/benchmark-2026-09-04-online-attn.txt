@@ -1,0 +1,19 @@
+configuration                          img/s   vs best Loom
+loom fp16 (batch 32)                  1303.3    1.00x  <-- this repo
+torch max-autotune fp16 (batch 64)    1280.7    0.98x
+loom fp16 (batch 64)                  1220.4    0.94x  <-- this repo
+loom fp16 (batch 8)                   1215.2    0.93x  <-- this repo
+torch compile fp16 (batch 64)         1131.2    0.87x
+torch eager fp16 (batch 64)            836.6    0.64x
+torch max-autotune fp16 (batch 1)      594.3    0.46x
+loom fp16 (batch 1)                    543.5    0.42x  <-- this repo
+torch compile fp16 (batch 1)           385.8    0.30x
+torch eager fp16 (batch 1)             288.5    0.22x
+torch max-autotune fp32 (batch 64)     255.9    0.20x
+loom fp32 (batch 32)                   230.8    0.18x  <-- this repo
+torch compile fp32 (batch 64)          174.2    0.13x
+torch eager fp32 (batch 64)            163.0    0.13x
+loom fp32 (batch 1)                    130.1    0.10x  <-- this repo
+torch compile fp32 (batch 1)           126.0    0.10x
+torch max-autotune fp32 (batch 1)      124.9    0.10x
+torch eager fp32 (batch 1)             115.2    0.09x

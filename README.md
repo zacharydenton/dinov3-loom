@@ -15,6 +15,10 @@ Vulkan by 45% on prefill in llama.cpp.
 
 The question this repo exists to answer: **is 88 img/s the silicon, or the toolchain?**
 
+It was the toolchain. A hand-written Loom forward pass reaches **1303 img/s** on
+ViT-S+/16 at batch 32, ahead of `max-autotune` (1280.7), at cosine 0.99998
+against transformers.
+
 ## Model
 
 `facebook/dinov3-vits16plus-pretrain-lvd1689m` — hidden 384, 12 layers, 6 heads
@@ -63,62 +67,61 @@ matching bug in the harness.
 ## Benchmark
 
 Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 3 interleaved rounds
-(`tools/benchmark.py`). The machine had other jobs on it throughout; interleaving
-means both sides saw the same contention.
+(`tools/benchmark.py`) on an idle GPU. Interleaving means both sides see the
+same conditions.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 1287.7 | 1.41x |
-| torch compile fp16, batch 64 | 1108.7 | 1.21x |
-| **loom fp16, batch 32** | **915.5** | **1.00x** |
-| **loom fp16, batch 8** | **857.4** | 0.94x |
-| **loom fp16, batch 64** | **853.0** | 0.93x |
-| torch eager fp16, batch 64 | 730.1 | 0.80x |
-| torch max-autotune fp16, batch 1 | 594.5 | 0.65x |
-| **loom fp16, batch 1** | **400.2** | 0.44x |
-| torch compile fp16, batch 1 | 387.1 | 0.42x |
-| torch eager fp16, batch 1 | 294.1 | 0.32x |
-| torch max-autotune fp32, batch 64 | 240.0 | 0.26x |
-| **loom fp32, batch 32** | **234.3** | 0.26x |
-| torch compile fp32, batch 64 | 167.8 | 0.18x |
-| torch eager fp32, batch 64 | 150.1 | 0.16x |
-| **loom fp32, batch 1** | **120.0** | 0.13x |
-| torch eager fp32, batch 1 | 115.3 | 0.13x |
+| **loom fp16, batch 32** | **1303.3** | **1.00x** |
+| torch max-autotune fp16, batch 64 | 1280.7 | 0.98x |
+| **loom fp16, batch 64** | **1220.4** | 0.94x |
+| **loom fp16, batch 8** | **1215.2** | 0.93x |
+| torch compile fp16, batch 64 | 1131.2 | 0.87x |
+| torch eager fp16, batch 64 | 836.6 | 0.64x |
+| torch max-autotune fp16, batch 1 | 594.3 | 0.46x |
+| **loom fp16, batch 1** | **543.5** | 0.42x |
+| torch compile fp16, batch 1 | 385.8 | 0.30x |
+| torch eager fp16, batch 1 | 288.5 | 0.22x |
+| torch max-autotune fp32, batch 64 | 255.9 | 0.20x |
+| **loom fp32, batch 32** | **230.8** | 0.18x |
+| torch compile fp32, batch 64 | 174.2 | 0.13x |
+| torch eager fp32, batch 64 | 163.0 | 0.13x |
+| **loom fp32, batch 1** | **130.1** | 0.10x |
+| torch eager fp32, batch 1 | 115.2 | 0.09x |
 
 Read it honestly:
 
-- **Every torch batch-1 configuration is beaten at both precisions**, and at fp32
-  torch's best of any batch is beaten too.
-- **At fp16 it now beats `torch.eager` at batch 64** (915.5 vs 730.1) while
-  running batches of 32. `torch.compile` is 1.21x ahead and `max-autotune` 1.41x,
-  down from 1.64x before this round of work.
-- **The remaining gap is attention**, at 36% of the time against a hand-tuned
-  AOTriton kernel, plus inductor's better matmul tiling. See
-  `docs/inductor-teardown.md`.
+- **It is faster than every torch configuration measured, at batch 32.** The
+  margin over `max-autotune` is 1.8% -- a win, but a narrow one, and closer to
+  run-to-run variance than the table's ordering suggests.
+- **Batch 1 still loses to `max-autotune`** (543.5 vs 594.3). It always has;
+  an earlier version of this table claimed otherwise and was wrong. What is true
+  is that batch 1 beats `torch.compile` and `torch.eager` at both precisions.
+- **The MLP is now the bottleneck**: gate/up+swiglu 30.1% of the forward pass,
+  the down projection 22.3%. Attention, which used to be 36.4%, is 10.2%.
 
 Accuracy: cosine **0.99998** against transformers on the full fp16 path (f16
 weights, f16 matmul-facing activations, f16 attention probabilities, f32
 accumulation throughout). The pure f32 path is exact to ten digits. xdna-vision
-gates DINOv3 at 0.997. `--f32`, `--no-flash` and `--f32-act` select the slower,
-more accurate paths independently.
+gates DINOv3 at 0.997. `--f32`, `--no-flash`, `--f32-act`, `--f32-qkv` and
+`--no-online-attn` select the slower, more accurate paths independently.
 
-Where the time goes at batch 8, everything on:
+Where the time goes at batch 32, everything on:
 
 ```
-attention              28.9%
-gate/up matmul         21.4%
-down matmul            17.5%
-qkv matmul              9.1%
-o matmul                5.6%
-layernorm               5.3%
-swiglu                  4.1%
-residual+ls             3.7%
-rope                    2.4%
+gate/up matmul + swiglu  30.1%
+down matmul              22.3%
+residual+norm            13.2%
+qkv matmul               12.9%
+attention                10.2%
+o matmul                  5.4%
+rope                      2.9%
+patch embed               1.6%
 ```
 
 The run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 (f32) -> 468 (WMMA) -> 667
-(flash attention) -> 758 (f16 activations) img/s; `docs/notes.md` has what each
-step was worth.
+(flash attention) -> 758 (f16 activations) -> 915 (kernel fusion) -> 1303
+(online-softmax attention) img/s; `docs/notes.md` has what each step was worth.
 
 ## Layout
 

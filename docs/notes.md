@@ -392,9 +392,9 @@ SwiGLU as an epilogue -- all removed work or traffic without spending registers
 or LDS. The one apparent exception, the dual-N SwiGLU matmul, spends both but
 deletes an entire pass in exchange.
 
-## Lever 5: the online-softmax attention port -- written, blocked on the compiler
+## Lever 5: the online-softmax attention -- landed, 4.4x
 
-`experiments/attention_online_f16_wmma.loom` is a complete port of
+`kernels/attention_online_f16_wmma.loom` is a port of
 `hrx-demos/kernels/ideogram4/attention_online_bf16_wmma.loom` to DINOv3's
 head_dim of 64: one wave32 per (16 query rows, head), 512 bytes of LDS used only
 to reinterpret an f32 score fragment as an f16 `lhs`, K and V fragment-loaded
@@ -402,91 +402,79 @@ straight from global with K transposed by a strided view, and eight loop-carried
 `vector<8xf32>` values -- running max and sum split across the two lane groups,
 plus four accumulators for the 64 output channels.
 
-**It does not lower on the HRX revision this repo is pinned to.** Both global
-fragment loads are rejected with:
+It took three findings to make it lower. Every global `vector.fragment.load` was
+rejected with `source-to-low constraint 'fragment_memory.dynamic_stride' is not
+satisfied`, including the plainest dense one, which is what finally pointed away
+from the transposed view and the loop.
 
-```
-source-to-low constraint 'fragment_memory.dynamic_stride' is not satisfied
-```
+### 1. `index.assume` on a fragment-load index term is fatal
 
-That is not a stride problem in the ordinary sense. Bisected against a minimal
-no-LDS matmul, all of these compile fine on the same revision:
+This is the whole thing. Reduced to a single load with the preamble kept
+verbatim, swapping the row index tells the story immediately:
 
-| probe | result |
+| load | result |
 | --- | --- |
-| global `lhs`/`rhs` fragment loads, dense view, runtime extent | compiles |
-| view stride 1152 wider than the 384 columns actually read | compiles |
-| transposed `rhs` via `encoding.layout.strided [1, k]` | compiles |
-| compile-time-constant view extent | only a bounds error, fixable |
+| `%v_view[%query_origin, %channel0]` | rejected |
+| `%v_view[%c0, %channel0]` | compiles |
+| `%v_view[%query_origin, %c0]` | rejected |
+| `%v_view[%query_origin0, %channel0]` (same value, no `index.assume`) | compiles |
 
-And none of these fix the attention kernel: raw config values instead of
-`index.assume`d ones, dense views for q and v, a static `token_capacity` extent,
-`mul(...,16)` proofs on the channel and on the tile origins, dropping `unroll`,
-or targeting `gfx1100` the way hrx-demos does.
+The bound's magnitude is irrelevant -- `range(%x, 0, 255)` is rejected exactly
+like `le(%x, %tile_origin_limit)`. `index.assume` replaces the value with an
+opaque one, so the fragment-memory planner can no longer compute its
+`byte_facts` and rejects the term.
 
-The likely reason is the revision. `hrx-demos` pins hrx-system at
-`13420558bb` (**15 July 2026**), which is *older* than this repo's `c9855b47e`
-(3 September). The constraint was tightened in between, so a technique that is
-load-bearing for every kernel in `hrx-demos` may simply not be expressible on
-current HRX in this form. Trying to confirm that by building `loom-compile` at
-their revision failed too: it does not configure under CMake at all
-(`iree_package_ns(): Could not determine package for experimental/id4/ideogram4`)
-because `hrx-demos` builds with Bazel.
+The constraint is misnamed, which is what made this take so long.
+`loom/src/loom/target/arch/amdgpu/lower/matrix_fragment_memory_plan.c:1352`
+checks that a dynamic address term's byte facts fit in unsigned 32 bits, not
+that the stride is dynamic. Twelve earlier hypotheses all asked *which facts to
+state*; the answer was to state none. `hrx-demos` uses no `index.assume`
+anywhere, and that is not a stylistic choice.
 
-### What the constraint actually checks
+### 2. `index.rem` is how the subrange analysis gets a bound
 
-`loom/src/loom/target/arch/amdgpu/lower/matrix_fragment_memory_plan.c:1352` rejects
-when, for any dynamic address term:
+Removing the assumes exposed the obligation they were there to discharge:
+`SUBRANGE/010`, the fragment footprint's upper bound. `index.rem` is the
+primitive the analysis follows through a workgroup id -- `%tile_in_image =
+index.rem %tile_id, %tiles_per_image` proved on its own. So `%head` and `%image`
+each get a no-op `rem` against a ceiling, which supplies the bound structurally
+instead of by assertion. Neither changes any address at runtime.
 
-```c
-term->byte_stride < 0 || term->byte_stride > UINT32_MAX ||
-!loom_low_source_memory_dynamic_term_fits_unsigned_bit_count(term, 32)
-```
+### 3. The assumes also blocked constant folding
 
-and that predicate is `loom_value_facts_fit_unsigned_bit_count(term->byte_facts, 32)`.
-So the name is misleading: it is not "the stride is dynamic", it is **the term's
-byte-offset facts must be provably within 32 bits**. That should be easy to
-satisfy, which is why the rest of this is puzzling.
+`index.assume` on `%hidden_size` and `%tokens_per_image` stopped those configs
+folding to literals, which left the `rem` divisors opaque and the *lower* bound
+(`0 <= origin`) unprovable. Dropping them closed it. Raw `config.get` values
+everywhere, exactly as hrx-demos does it.
 
-### Eliminated
+### A trap on the way
 
-A minimal reproducer (`33 lines`, wave32, dense `view<[capacity]x[1152]xf16>`,
-workgroup-derived row and channel with literal `range` facts, `lhs` and `rhs`
-fragment loads inside a loop) **compiles**. Adding a transposed
-`encoding.layout.strided [1, stride]` view for the `rhs`: still compiles. Nesting
-that loop inside an outer loop carrying the accumulator fragment: still compiles.
+Adding `where [range(%token_count, 16, 65536)]` to the launch made it compile
+before finding (2) and (3) -- and reintroduced the known launch-argument
+miscompile: a wild address under plain `hipModuleLaunchKernel`, faulting
+identically at every buffer size from 217 to 8192 rows. The `rem` bounds make it
+unnecessary. The rule from the earlier `where` bug stands: **never put `where` on
+a launch argument.**
 
-None of the following makes the real kernel compile:
+### What it is worth
 
-* bounding `%token_count` with `range(...)`
-* literal `range` facts on every address term instead of `le(...)`
-* shrinking `token_capacity` from 262144 to 4096, so every byte range is tiny
-* raw `config.get` values instead of `index.assume`d ones in the view types
-* dense views for q and v with the head channel indexed directly
-* a compile-time-constant view extent
-* `mul(..., 16)` alignment facts on the channel and on both tile origins
-* removing `unroll` from the QK loop
-* targeting `gfx1100`, as hrx-demos does
-* moving the image onto a third grid axis so no index comes from a division
-* `tokens_per_image = 208` so every tile origin really is 16-aligned
+Against the flash kernel it replaces, standalone, batch 4, stride 384:
 
-So the feature works on this revision and the reproducer proves it; something
-structural in the full kernel defeats the fact analysis and it is not any of the
-dozen things above.
+| | us | GFLOP/s | max_abs |
+| --- | ---: | ---: | ---: |
+| `flash_attention_f16_wmma` | 131.87 | 1882 | 2.2e-04 |
+| `attention_online_f16_wmma` | 30.01 | 8272 | 4.9e-05 |
 
-### Next
+**4.4x, and more accurate besides.** Attention falls from 36.4% of the forward
+pass to 10.2%. The prediction in `path-to-1300.md` was that 12 TFLOP/s on
+attention would reach 1321 img/s; 8.3 TFLOP/s predicted ~1269 and the model
+measured 1312.9 at batch 32.
 
-The remaining approach is to bisect the *real* kernel downward rather than the
-reproducer upward -- delete the P*V half, then the softmax, then the online
-bookkeeping, until it compiles -- which is mechanical but wants a batch of
-compiles. Failing that:
+The kernel requires f16 q/k/v, which flips `--f16-qkv` from a measured loss into
+the default. That earlier negative result was real but narrow: narrowing bought
+the *old* attention nothing, so it only cost bandwidth. The lesson is that a
+negative result about a supporting change is only valid against the consumer it
+was measured with.
 
-1. build the July revision through Bazel (`python dev.py setup --release` in
-   `hrx-demos`, which vendors its own hrx-system) and compile the ported kernel
-   there, to confirm the technique works and measure what it is worth; or
-2. find what replaced it on current HRX -- there may be a newer spelling for a
-   global fragment load that satisfies the constraint, and `loom-lint` or the
-   `hrx-loom-kernels` contribution gates may document it.
-
-Until one of those is answered, the 5x on attention identified in
-`docs/path-to-1300.md` is blocked on the toolchain rather than on the kernel.
+The bottleneck is now the MLP: gate/up+swiglu at 30.1% and the down projection at
+22.3%.

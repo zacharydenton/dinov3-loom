@@ -1,4 +1,22 @@
-# The path past torch max-autotune (1287.7 img/s)
+# The path past torch max-autotune -- reached
+
+**Done: 1303.3 img/s vs torch max-autotune's 1280.7**, measured interleaved on an
+idle GPU (`docs/benchmark-2026-09-04-online-attn.txt`). It took one change, the
+one this document predicted: the online-softmax attention kernel, which took
+attention from 1.88 to 8.3 TFLOP/s and from 36.4% of the forward pass to 10.2%.
+The margin is 1.8%, which is narrow -- this is a win, not a rout.
+
+Every batch improved 36-43% over the 915.5 baseline: batch 1 400.2 -> 543.5,
+batch 8 857.4 -> 1215.2, batch 32 915.5 -> 1303.3, batch 64 853.0 -> 1220.4.
+Batch 1 still loses to torch max-autotune (594.3); it always did.
+
+The MLP is now the bottleneck: gate/up+swiglu 30.1%, down 22.3%. See
+`docs/notes.md` "Lever 5" for how the kernel was unblocked.
+
+---
+
+## The original analysis (at 915.5 img/s)
+
 
 Current: **915.5 img/s**, or 1.092 ms per image at batch 32.
 Target: 1287.7 img/s, or 0.777 ms. The gap is **0.315 ms per image**.
