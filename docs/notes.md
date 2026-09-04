@@ -703,3 +703,64 @@ that differ only by a flag that is *gated off* at that batch -- i.e. identical
 work. The noise floor on this box, with a 10-core CPU job resident, is about
 +/-10% on end-to-end throughput at low repeat counts. Anything under ~1.15x
 needs repeat=800 and best-of-7 before it means anything.
+
+## Lever 11: k-block 64 -- rejected, and what it says about the ceiling
+
+The k-loop pays two workgroup barriers per k-block. At k=384 with a 32-deep
+block that is 12 trips and 24 barriers for 24 MMAs per wave. Doubling the block
+to 64 halves both, and the LDS arithmetic works out exactly: A and W staging at
+64x72 f16 is 9216 B each, and with the result tiles laid over them the arena is
+18432 B -- **3 workgroups/CU, the measured optimum**, unchanged. It compiles at
+96 VGPRs, inside the 128 available at that occupancy.
+
+It loses. Two runs, batch 32: qkv 0.92x/0.93x, gate/up 0.96x/0.92x, o 0.78x/1.07x,
+down 1.01x/1.04x. So the barriers were not the bottleneck -- doubling the block
+doubles the LDS staging per trip as well, and the loop is bound by the
+LDS->register fragment loads and the MMA issue rate rather than by
+synchronisation.
+
+**That is the fifth consecutive failed attempt to make this matmul faster** --
+128x64 no-LDS (Lever 6), LDS aliasing for occupancy (7), 64x128 register
+blocking (8), 64x32 narrow (10), and now k-depth. The structure resists tile
+shape, occupancy, LDS budget, register blocking and k-block depth alike. The
+46% of peak that gate/up reaches is what this kernel design gives on this part.
+
+### So: is there a path to 2000 img/s?
+
+Not in fp16. From 1333 img/s (0.750 ms/img, 16.3 TFLOP/s effective):
+
+| | ms/img | img/s |
+| --- | ---: | ---: |
+| today | 0.750 | 1333 |
+| fuse *all* elementwise away | 0.625 | 1599 |
+| + attention 9.5 -> 20 TFLOP/s | 0.585 | 1711 |
+| + every matmul at gate/up's 46% | 0.511 | 1959 |
+
+The last row is the fp16 ceiling and it is still under 2000 -- and it assumes
+zero elementwise cost, attention more than doubled, and the down/qkv/o matmuls
+all lifted to the best matmul's efficiency after five attempts to lift any of
+them have failed. Realistically fp16 tops out around **1600-1700**.
+
+**int8 WMMA is the only thing that moves the ceiling.** RDNA3.5 runs
+`v_wmma_i32_16x16x16_iu8` at 1024 ops/clk/CU against f16's 512, so peak roughly
+doubles to ~106 TOPS, and Loom exposes the op (`amdgpu.v_wmma_i32_16x16x16_iu8`,
+alongside iu4 and a 16x16x64 iu8 form). Halving matmul time at today's
+utilisation:
+
+| int8 utilisation | ms/img | img/s |
+| --- | ---: | ---: |
+| same as today's f16 | 0.449 | **2228** |
+| 75% of today's | 0.540 | 1851 |
+| 60% of today's | 0.631 | 1584 |
+
+So 2000 is reachable through int8 and essentially nowhere else. The work is
+per-channel weight quantisation, activation scales, an int32 accumulator and a
+requantising epilogue, with the residual stream, norms and softmax staying
+floating point. The open question is accuracy: this repo currently sits at
+cosine 0.99998 against a 0.997 gate, which is a lot of headroom, but int8 PTQ on
+a 12-layer ViT with LayerScale needs measuring, not assuming.
+
+Note also that fp8 is *not* an option here: gfx1151 is RDNA3.5 and its WMMA has
+no fp8 form (the fp8 opcodes in the Loom tables are for later targets). fp8
+weights would also not have helped batch 1, which is workgroup-starved rather
+than bandwidth-starved -- see Lever 10.
