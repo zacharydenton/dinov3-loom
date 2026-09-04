@@ -586,3 +586,75 @@ matmul shape on gfx1151 the target is *3 workgroups per CU*, not maximum
 occupancy, and there is ~21.5 KB of LDS available at that occupancy against the
 18.4 KB currently used. Spending that 3 KB on a deeper k-block, rather than on
 more workgroups, is the version of this idea that has not been tried.
+
+## Lever 8: a 64x128 tile for the latency-bound down projection -- rejected
+
+Classifying stages by *what bounds them* rather than by their share of the
+profile (see Lever 9 below for the table) put the down projection at 32% of peak
+compute and 22% of peak bandwidth -- bound by neither, i.e. stalling. The
+standard answer is more work in flight per wave, and the register budget said
+there was room: at the measured-optimal 3 workgroups/CU (24 waves, 12 per SIMD)
+each wave may use 1536/12 = **128 VGPRs**, and the 64x64 kernel uses **64**.
+
+`experiments/matmul_bias_f16_wmma_n128.loom` doubles the tile to 64x128: eight
+waves with four accumulator fragments each instead of two, W staged 128 rows
+wide, four `vector.mma` per `lhs` fragment load instead of two. It lands at 88
+VGPRs, comfortably inside the budget.
+
+It is slower at every occupancy point, and the occupancy sweep reproduces:
+
+| LDS/wg | wg/CU | waves | n128 down | n64 down |
+| ---: | ---: | ---: | ---: | ---: |
+| 15360 | 4 | 32 | 12.6 TFLOP/s | 15.4 |
+| **21504** | **3** | **24** | **16.4** | **17.5** |
+| 23552 | 2 | 16 | 15.0 | 16.4 |
+
+0.94x at the best occupancy point, 0.87-0.97x across the other shapes (o, qkv).
+Correct throughout (cosine 0.99999998).
+
+So the wider tile does not help even with occupancy held at its optimum, and the
+VGPR headroom is not the binding resource. Together with Lever 6 (a 128x64
+no-LDS tile, 0.34-1.18x) and Lever 7 (aliasing LDS for full occupancy, uniformly
+slower), **three separate attempts to restructure this matmul have now lost.**
+The 64x64 staged tile at 3 workgroups/CU is a local optimum in tile shape,
+occupancy and LDS budget simultaneously, and the ~32-46% of peak these kernels
+reach is not reachable-past by tiling changes. Whatever is left is instruction
+scheduling and software pipelining inside the k-loop, which this Loom revision
+does not obviously expose.
+
+## Lever 9: classify stages by what bounds them, not by their share
+
+The profile says where time goes; it does not say what to do about it. Dividing
+each stage's FLOPs and bytes by its measured time, against the 8060S's ~53
+TFLOP/s and ~256 GB/s, says which lever can even work. At batch 32, before the
+f16-branch change:
+
+| stage | ms | TFLOP/s | %peak | GB/s | %peak | bound by |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| gate/up | 7.49 | 24.3 | 46% | 43 | 17% | compute |
+| down | 5.60 | 16.3 | 31% | 66 | 26% | **neither -- latency** |
+| resid+norm | 2.95 | - | - | 141 | 55% | **bandwidth** |
+| attention | 2.60 | 9.2 | 17% | 91 | 36% | neither |
+| o | 1.30 | 17.5 | 33% | 139 | 54% | **bandwidth** |
+| qkv | 3.22 | 21.2 | 40% | 77 | 30% | compute |
+| rope | 0.71 | - | - | 333 | 130% | cache-resident |
+
+Two things fall out that the share-of-time view hides.
+
+`rope` reads and writes at an apparent 333 GB/s, which is above what the memory
+can do -- so it is being served from L2/L3, having just been written by the qkv
+matmul. It is already fast; fusing it would save traffic that is not actually
+going to memory. Deprioritised.
+
+`o` and `resid+norm` were the two bandwidth-bound stages, and both sat on the
+same intermediate: the o/down projections wrote f32 into `proj`/`mlp` and
+resid+norm read it straight back. That branch is produced by a matmul and
+consumed exactly once, so f32 doubled its traffic for precision that does not
+survive the residual add. Narrowing it to f16 was worth **1.13x end to end**
+(1176.6 -> 1333.4 img/s, best-of-5 interleaved) at unchanged accuracy -- and it
+is the only one of four attempted optimisations in this round that worked.
+
+The other three all tried to make a compute- or latency-bound kernel faster by
+restructuring it, and all three lost. The one that worked removed bytes from a
+stage that the numbers said was bandwidth-bound. Worth remembering as the order
+to try things in.
