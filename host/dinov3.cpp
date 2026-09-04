@@ -283,7 +283,7 @@ int main(int argc, char **argv) {
     const bool use_qkv_rope = narrow_qkv && rows >= qkv_rope_rows;
     // The split-K down path writes partials, so its residual add would have
     // to live in the reduction instead; keep the old path there for now.
-    const bool use_resid = narrow_branch && fuse_resid && fuse_norm && !use_splitk;
+    const bool use_resid = narrow_branch && fuse_resid && fuse_norm;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
     const bool fused_swiglu = narrow_act && fuse_swiglu;
@@ -460,7 +460,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (use_splitk) {
-                Stage stage("down matmul");
+                Stage stage("down matmul+resid");
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(act); args.pointer(PW(p + "down_w"));
@@ -473,8 +473,15 @@ int main(int argc, char **argv) {
                                                 THREADS, 1, 1, 0, nullptr, nullptr, cfg));
                 KernArgs red;
                 red.scalar_i32(rows);
-                red.pointer(partials); red.pointer(W(p + "down_b")); red.pointer(mlp);
+                red.pointer(partials); red.pointer(W(p + "down_b"));
+                red.pointer(use_resid ? x : mlp);
+                red.pointer(W(p + "ls2"));
                 launch(splitk_reduce.function, rows, 1, red);
+                if (use_resid && layer + 1 < LAYERS) {
+                    std::string next = "l" + std::to_string(layer + 1) + "_";
+                    Stage stage2("layernorm");
+                    norm(x, W(next + "norm1_w"), W(next + "norm1_b"), h, narrow_act);
+                }
             } else if (use_resid) {
                 { Stage stage("down matmul+resid");
                   matmul_resid(resid_down, rows, HIDDEN, act, PW(p + "down_w"),

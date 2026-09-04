@@ -1,4 +1,6 @@
-// Sums the split-K partial slabs, adds the bias and narrows to f16.
+// Sums the split-K partial slabs, adds the bias and LayerScale, and
+// accumulates into the residual stream -- the same epilogue the non-split-K
+// o/down projections do inline.
 //
 // The partials are [splits][token_count][n_size] f32; the output is
 // [token_count][n_size] f16, matching what the af16_cf16 matmul would have
@@ -15,7 +17,7 @@ kernel.def target(@dinov3_splitk_reduce_gfx11) export("dinov3_splitk_reduce_f16"
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
-} launch(%token_count: index, %partials: buffer, %bias: buffer, %out: buffer) {
+} launch(%token_count: index, %partials: buffer, %bias: buffer, %out: buffer, %lambda: buffer) {
   %n_size = config.get @dinov3.splitk_reduce_f16.n_size : index
   %splits = config.get @dinov3.splitk_reduce_f16.splits : index
   %c0 = index.constant 0 : index
@@ -35,10 +37,12 @@ kernel.def target(@dinov3_splitk_reduce_gfx11) export("dinov3_splitk_reduce_f16"
   %partials_global = buffer.assume.memory_space<global> %partials : buffer
   %bias_global = buffer.assume.memory_space<global> %bias : buffer
   %out_global = buffer.assume.memory_space<global> %out : buffer
+  %lambda_global = buffer.assume.memory_space<global> %lambda : buffer
   %partial_rows = index.mul %splits, %token_bounded : index
   %partials_view = buffer.view %partials_global[%c0_offset] : buffer -> view<[%partial_rows]x[%n_size]xf32>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
   %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_bounded]x[%n_size]xf16>
+  %lambda_view = buffer.view %lambda_global[%c0_offset] : buffer -> view<[%n_size]xf32>
 
   // The loop starts on a multiple of 4 and n_size is a multiple of 64, so a
   // vector4 never straddles the end -- but the induction variable's bound is
@@ -58,7 +62,12 @@ kernel.def target(@dinov3_splitk_reduce_gfx11) export("dinov3_splitk_reduce_f16"
     }
     %bias_values = vector.load %bias_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
     %biased = vector.addf %total, %bias_values : vector<4xf32>
-    %narrow = vector.fptrunc %biased : vector<4xf32> to vector<4xf16>
+    %lambda_values = vector.load %lambda_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
+    %prior_half = vector.load %out_view[%token, %column] : view<[%token_bounded]x[%n_size]xf16> -> vector<4xf16>
+    %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
+    %scaled = vector.mulf %biased, %lambda_values : vector<4xf32>
+    %updated = vector.addf %prior, %scaled : vector<4xf32>
+    %narrow = vector.fptrunc %updated : vector<4xf32> to vector<4xf16>
     vector.store %narrow, %out_view[%token, %column] : vector<4xf16>, view<[%token_bounded]x[%n_size]xf16>
   }
   }
