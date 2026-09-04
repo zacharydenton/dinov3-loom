@@ -68,37 +68,33 @@ means both sides saw the same contention.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 1278.6 | 1.64x |
-| torch compile fp16, batch 64 | 1117.0 | 1.44x |
-| torch eager fp16, batch 64 | 838.8 | 1.08x |
-| **loom fp16, batch 32** | **778.3** | **1.00x** |
-| **loom fp16, batch 8** | **765.8** | 0.98x |
-| **loom fp16, batch 64** | **732.8** | 0.94x |
-| torch max-autotune fp16, batch 1 | 599.7 | 0.77x |
-| **loom fp16, batch 1** | **368.9** | 0.47x |
-| torch compile fp16, batch 1 | 340.8 | 0.44x |
-| torch eager fp16, batch 1 | 294.7 | 0.38x |
-| torch max-autotune fp32, batch 64 | 234.6 | 0.30x |
-| **loom fp32, batch 32** | **219.6** | 0.28x |
-| torch compile fp32, batch 64 | 167.8 | 0.22x |
-| torch eager fp32, batch 64 | 148.9 | 0.19x |
-| **loom fp32, batch 1** | **119.4** | 0.15x |
-| torch eager fp32, batch 1 | 115.4 | 0.15x |
-
-Measured with `gpu_busy_percent` at 0 before the run, unlike the earlier tables
-in this file's history. `docs/inductor-teardown.md` explains where torch's
-remaining 1.64x comes from -- it is the matmul k-loop and AOTriton, not fusion.
+| torch max-autotune fp16, batch 64 | 1287.7 | 1.41x |
+| torch compile fp16, batch 64 | 1108.7 | 1.21x |
+| **loom fp16, batch 32** | **915.5** | **1.00x** |
+| **loom fp16, batch 8** | **857.4** | 0.94x |
+| **loom fp16, batch 64** | **853.0** | 0.93x |
+| torch eager fp16, batch 64 | 730.1 | 0.80x |
+| torch max-autotune fp16, batch 1 | 594.5 | 0.65x |
+| **loom fp16, batch 1** | **400.2** | 0.44x |
+| torch compile fp16, batch 1 | 387.1 | 0.42x |
+| torch eager fp16, batch 1 | 294.1 | 0.32x |
+| torch max-autotune fp32, batch 64 | 240.0 | 0.26x |
+| **loom fp32, batch 32** | **234.3** | 0.26x |
+| torch compile fp32, batch 64 | 167.8 | 0.18x |
+| torch eager fp32, batch 64 | 150.1 | 0.16x |
+| **loom fp32, batch 1** | **120.0** | 0.13x |
+| torch eager fp32, batch 1 | 115.3 | 0.13x |
 
 Read it honestly:
 
 - **Every torch batch-1 configuration is beaten at both precisions**, and at fp32
   torch's best of any batch is beaten too.
-- **At fp16 it is within 10% of `torch.eager` at batch 64** (758.4 vs 836.4) while
-  running batches of 8. `torch.compile` is 1.29x ahead and `max-autotune` 1.66x.
-- **The batch curve is flat from 8 upward** (766 / 778 / 733 at 8 / 32 / 64) on an idle machine; batch 1 costs about half the throughput. Individual
-  samples for one configuration have ranged 115 to 243 img/s on this machine
-  during other work. Treat anything inside ~20% as a tie, and rerun on an idle
-  box before drawing conclusions.
+- **At fp16 it now beats `torch.eager` at batch 64** (915.5 vs 730.1) while
+  running batches of 32. `torch.compile` is 1.21x ahead and `max-autotune` 1.41x,
+  down from 1.64x before this round of work.
+- **The remaining gap is attention**, at 36% of the time against a hand-tuned
+  AOTriton kernel, plus inductor's better matmul tiling. See
+  `docs/inductor-teardown.md`.
 
 Accuracy: cosine **0.99998** against transformers on the full fp16 path (f16
 weights, f16 matmul-facing activations, f16 attention probabilities, f32
