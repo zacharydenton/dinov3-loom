@@ -50,12 +50,15 @@ step "runner rejects bad input" bash -c '
   ! ./host/dinov3 --input build/patchified.bin --batch 999 2>&1 | grep -q "must be 1"       && exit 1
   ! ./host/dinov3                               2>&1 | grep -q "input is required" && exit 1
   printf short > /tmp/dinov3-short.bin
-  ! ./host/dinov3 --input /tmp/dinov3-short.bin 2>&1 | grep -q "expected"          && exit 1
+  ! ./host/dinov3 --input /tmp/dinov3-short.bin 2>&1 | grep -q "not a multiple"     && exit 1
+  # a whole number of images, but not the number asked for
+  cat build/patchified.bin build/patchified.bin > /tmp/dinov3-two.bin
+  ! ./host/dinov3 --input /tmp/dinov3-two.bin --batch 3 2>&1 | grep -q "holds 2 images" && exit 1
   ! ./host/loomrun --hsaco x --kernel k --out "$(python3 -c "print(\"A\"*900)"):16" 2>&1 \
       | grep -q "path too long"                                                    && exit 1
   args=(--hsaco x --kernel k); for i in $(seq 40); do args+=(--i32 1); done
   ! ./host/loomrun "${args[@]}" 2>&1 | grep -q "too many args"                     && exit 1
-  rm -f /tmp/dinov3-short.bin'
+  rm -f /tmp/dinov3-short.bin /tmp/dinov3-two.bin'
 
 if [ "$quick" = 0 ]; then
   # torch links its own ROCm; env.sh points LD_LIBRARY_PATH at the HRX
@@ -63,6 +66,7 @@ if [ "$quick" = 0 ]; then
   # needs that path, and validate.py shells out to host/dinov3 for the GPU
   # work, so drop it for this step.
   step "end-to-end vs transformers" env -u LD_LIBRARY_PATH python3 tools/validate.py
+  step "batched python API vs transformers" env -u LD_LIBRARY_PATH python3 tools/test_batch.py
 fi
 
 printf '\n'

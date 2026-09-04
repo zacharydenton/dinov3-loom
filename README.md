@@ -187,6 +187,73 @@ hide behind a matching bug in the harness.
 On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts under HRX and
 `scripts/env.sh` shims around it.
 
+## Replacing a PyTorch DINOv3
+
+`tools/dinov3_loom.py` takes the same `pixel_values` an HF image processor
+produces and returns the same array as `last_hidden_state`. The swap is two
+lines:
+
+```python
+# before
+from transformers import AutoModel
+model = AutoModel.from_pretrained("facebook/dinov3-vits16plus-pretrain-lvd1689m").eval().cuda()
+with torch.no_grad():
+    tokens = model(pixel_values=pixel_values.cuda()).last_hidden_state.cpu().numpy()
+
+# after
+from dinov3_loom import DINOv3Loom
+model = DINOv3Loom()
+tokens = model(pixel_values)          # numpy in, numpy out; no torch needed
+```
+
+Both give `(B, 201, 384)`: token 0 is CLS, 1..4 are the register tokens, 5.. are
+the 196 patches. A complete example, with the preprocessing an image processor
+would normally do:
+
+```python
+import numpy as np
+from PIL import Image
+from dinov3_loom import DINOv3Loom
+
+MEAN = np.array([0.485, 0.456, 0.406], np.float32)[:, None, None]
+STD = np.array([0.229, 0.224, 0.225], np.float32)[:, None, None]
+
+def preprocess(paths):
+    out = []
+    for path in paths:
+        image = Image.open(path).convert("RGB").resize((224, 224), Image.BICUBIC)
+        pixels = np.asarray(image, np.float32).transpose(2, 0, 1) / 255.0
+        out.append((pixels - MEAN) / STD)
+    return np.stack(out)
+
+model = DINOv3Loom()
+tokens = model(preprocess(["a.jpg", "b.jpg"]))   # (2, 201, 384)
+
+cls = tokens[:, 0]                               # (2, 384) image embedding
+patches = tokens[:, 5:].reshape(-1, 14, 14, 384) # (2, 14, 14, 384) dense features
+```
+
+`model.cls(...)` and `model.patch_mean(...)` are shorthands for the two things
+people usually take off DINOv3.
+
+### What to know before swapping
+
+- **Accuracy is 0.99998 cosine against transformers**, not bitwise equality.
+  That is well inside the noise for retrieval, clustering and linear probes; if
+  you are comparing embeddings against a store built with the torch model,
+  rebuild the store rather than mixing the two.
+- **The shape is fixed at 224x224, ViT-S+/16.** The kernels are compiled for
+  201 tokens, 384 hidden, 6 heads. A different resolution or variant needs
+  different `--config` values in `scripts/build_kernels.sh`, and the RoPE and
+  attention kernels assume head_dim 64.
+- **Batches above 64 are split automatically**, because the kernels bound their
+  image index at a compiled `max_images` of 64.
+- **Each call is a subprocess**, costing a few milliseconds plus two file
+  copies. That is fine amortised over a batch and wasteful for single images in
+  a tight loop; batch 32 is where the throughput number comes from.
+- **gfx1151 only.** The HSACOs are compiled for that target; `LOOM_TARGET`
+  changes it, but nothing else here has been measured on another chip.
+
 ## Two things that will bite you
 
 1. **Never put `where [range(...)]` on a launch argument** if you plan to launch the

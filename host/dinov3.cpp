@@ -240,23 +240,33 @@ int main(int argc, char **argv) {
     k = q + qkv_step; v = q + 2 * qkv_step;
 
     {
-        // One patchified image, replicated to fill the batch. Required: without
-        // it the input buffer would be launched uninitialised.
+        // The input holds either one patchified image, which is replicated to
+        // fill the batch (how the benchmarks are run), or exactly `batch` of
+        // them, which is how inference is run.
         if (input_path.empty()) {
-            fprintf(stderr, "--input is required (a %d x %d f32 patchified image; "
-                            "tools/reference.py patchify writes one)\n", PATCHES, PATCH_K);
+            fprintf(stderr, "--input is required: %d x %d f32 per image, either one "
+                            "image or exactly --batch of them (tools/dinov3_loom.py "
+                            "writes this)\n", PATCHES, PATCH_K);
             return 64;
         }
-        const size_t want = size_t(PATCHES) * PATCH_K * sizeof(float);
+        const size_t per_image = size_t(PATCHES) * PATCH_K * sizeof(float);
         auto pixels = read_file(input_path);
-        if (pixels.size() != want) {
-            fprintf(stderr, "%s is %zu bytes, expected %zu (%d patches x %d f32)\n",
-                    input_path.c_str(), pixels.size(), want, PATCHES, PATCH_K);
+        if (pixels.size() % per_image != 0) {
+            fprintf(stderr, "%s is %zu bytes, not a multiple of %zu (%d patches x %d f32)\n",
+                    input_path.c_str(), pixels.size(), per_image, PATCHES, PATCH_K);
             return 64;
         }
-        for (int b = 0; b < batch; ++b)
+        const size_t supplied = pixels.size() / per_image;
+        if (supplied != 1 && supplied != size_t(batch)) {
+            fprintf(stderr, "%s holds %zu images; expected 1 (replicated) or %d (--batch)\n",
+                    input_path.c_str(), supplied, batch);
+            return 64;
+        }
+        for (int b = 0; b < batch; ++b) {
+            const char *src = pixels.data() + (supplied == 1 ? 0 : size_t(b) * per_image);
             HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)(image + size_t(b) * PATCHES * PATCH_K),
-                                    pixels.data(), want));
+                                    (void *)src, per_image));
+        }
     }
 
     auto matmul = [&](Kernel &kernel, int m, int n, const float *a, const void *w,
