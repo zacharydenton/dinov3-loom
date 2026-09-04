@@ -65,6 +65,20 @@ EDITS = {
         ],
         "// VARIANT: writes f16 straight into the output projection's activation.",
     ),
+    "attention_online_f16_wmma.loom": (
+        "attention_online_f16_wmma_cf16.loom",
+        "dinov3_attention_online_f16_wmma", "dinov3.attention_online_f16_wmma",
+        [
+            ("""  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size0]xf32>""",
+             """  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size0]xf16>"""),
+            ("""      %values = vector.load %result_view[%row, %column] : view<16x64xf32> -> vector<4xf32>""",
+             """      %wide = vector.load %result_view[%row, %column] : view<16x64xf32> -> vector<4xf32>
+      %values = vector.fptrunc %wide : vector<4xf32> to vector<4xf16>"""),
+            ("""      vector.store %values, %out_view[%global_row, %out_column] : vector<4xf32>, view<[%token_count]x[%hidden_size0]xf32>""",
+             """      vector.store %values, %out_view[%global_row, %out_column] : vector<4xf16>, view<[%token_count]x[%hidden_size0]xf16>"""),
+        ],
+        "// VARIANT: writes f16 straight into the output projection's activation.",
+    ),
     "rope_2d_f32.loom": (
         "rope_2d_f16.loom", "dinov3_rope_2d_f32", "dinov3.rope_2d_f32",
         [
@@ -125,6 +139,7 @@ SUFFIX = {
     "flash_attention_f16_wmma.loom": "_cf16",
     "rope_2d_f32.loom": "_f16",
     "flash_attention_f16_wmma_cf16.loom": "_af16",
+    "attention_online_f16_wmma.loom": "_cf16",
 }
 
 

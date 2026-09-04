@@ -90,3 +90,13 @@ compile flash_attention_f16_wmma_af16_cf16 dinov3_flash_attention_f16_wmma_cf16_
   dinov3.flash_attention_f16_wmma_cf16_af16.qkv_stride=1152 \
   dinov3.flash_attention_f16_wmma_cf16_af16.tokens_per_image=201 \
   dinov3.flash_attention_f16_wmma_cf16_af16.scale=0.125
+# The hrx-demos online-softmax attention: one wave32 per (16 queries, head), K
+# and V read from global as fragments. token_capacity only bounds the views;
+# max_images bounds the image index so the fragment loads prove in range.
+compile attention_online_f16_wmma_cf16 dinov3_attention_online_f16_wmma_cf16 attention_online_cf16 \
+  dinov3.attention_online_f16_wmma_cf16.hidden_size=384 \
+  dinov3.attention_online_f16_wmma_cf16.qkv_stride=1152 \
+  dinov3.attention_online_f16_wmma_cf16.tokens_per_image=201 \
+  dinov3.attention_online_f16_wmma_cf16.scale=0.125 \
+  dinov3.attention_online_f16_wmma_cf16.max_images=64 \
+  dinov3.attention_online_f16_wmma_cf16.token_capacity=262144

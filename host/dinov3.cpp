@@ -106,12 +106,17 @@ struct KernArgs {
     }
 };
 
-void launch(hipFunction_t function, unsigned gx, unsigned gy, KernArgs &args) {
+void launchBlock(hipFunction_t function, unsigned gx, unsigned gy, unsigned block,
+                 KernArgs &args) {
     void *config[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes,
                        HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size,
                        HIP_LAUNCH_PARAM_END };
-    HIP_CHECK(hipModuleLaunchKernel(function, gx, gy, 1, THREADS, 1, 1, 0, nullptr,
+    HIP_CHECK(hipModuleLaunchKernel(function, gx, gy, 1, block, 1, 1, 0, nullptr,
                                     nullptr, config));
+}
+
+void launch(hipFunction_t function, unsigned gx, unsigned gy, KernArgs &args) {
+    launchBlock(function, gx, gy, THREADS, args);
 }
 
 }  // namespace
@@ -126,11 +131,12 @@ int main(int argc, char **argv) {
     // simpler single-tile path and the flag is here to re-measure on an idle box.
     int repeat = 1, batch = 1, wide_threshold = 1 << 30;
     bool wmma = true, flash_attn = true, f16_act = true;
-    // Carrying q/k/v as f16 through rope and attention MEASURED SLOWER -- 662 vs
-    // 770 img/s at batch 8 and 529 vs 703 at batch 32, best of 4. The kernels
-    // are generated and compile fine, so --f16-qkv keeps them reachable, but the
-    // default is off. See docs/notes.md.
-    bool f16_qkv = false;
+    // q/k/v carried as f16 through rope and attention. This LOST with the old
+    // flash kernel -- 662 vs 770 img/s at batch 8, 529 vs 703 at batch 32 --
+    // because narrowing bought that kernel nothing. The online-softmax
+    // attention reads q/k/v as global fragments and *requires* f16, and with it
+    // the same switch wins outright. --f32-qkv opts back out.
+    bool f16_qkv = true;
     bool fuse_norm = true;     // residual + LayerScale + LayerNorm in one kernel
     bool fuse_swiglu = true;   // gate/up projection with SwiGLU as its epilogue
     // Query rows per attention workgroup. 32 was tried: it halves how often K
@@ -138,6 +144,9 @@ int main(int argc, char **argv) {
     // needs 53760 bytes of LDS against 40064 and produces half as many
     // workgroups, and it lost at batch 8. See docs/notes.md.
     int attn_tile = 16;
+    // The hrx-demos online-softmax shape: one wave32 per (16 queries, head),
+    // K and V read straight from global as fragments. Needs f16 q/k/v.
+    bool online_attn = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -152,10 +161,11 @@ int main(int argc, char **argv) {
         else if (a == "--f32") wmma = false;
         else if (a == "--no-flash") flash_attn = false;
         else if (a == "--f32-act") f16_act = false;
-        else if (a == "--f16-qkv") f16_qkv = true;
+        else if (a == "--f32-qkv") f16_qkv = false;
         else if (a == "--no-fuse-norm") fuse_norm = false;
         else if (a == "--no-fuse-swiglu") fuse_swiglu = false;
         else if (a == "--attn-tile") attn_tile = std::stoi(next());
+        else if (a == "--no-online-attn") online_attn = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -192,6 +202,7 @@ int main(int argc, char **argv) {
     Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
+    Kernel attn_online;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -223,6 +234,7 @@ int main(int argc, char **argv) {
     residual_norm.load(kernels_dir, "residual_layernorm", "dinov3_residual_layernorm_f32");
     wmma_swiglu.load(kernels_dir, "wmma_swiglu_k384_n1536", "dinov3_matmul_swiglu_f16_wmma");
     flash16_af16.load(kernels_dir, "flash_attention_af16", "dinov3_flash_attention_f16_wmma_cf16_af16");
+    attn_online.load(kernels_dir, "attention_online_cf16", "dinov3_attention_online_f16_wmma_cf16");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -244,7 +256,7 @@ int main(int argc, char **argv) {
     float *x, *h, *q, *k, *v, *attn, *proj, *gate, *up, *act, *mlp, *out, *image, *patched;
     auto alloc = [](float **p, size_t floats) { HIP_CHECK(hipMalloc(p, floats * sizeof(float))); };
     alloc(&x, size_t(rows) * HIDDEN);      alloc(&h, size_t(rows) * HIDDEN);
-    alloc(&q, size_t(rows) * QKV);         alloc(&attn, size_t(rows) * HIDDEN);
+    alloc(&q, size_t(rows + 16) * QKV);         alloc(&attn, size_t(rows) * HIDDEN);
     alloc(&proj, size_t(rows) * HIDDEN);   alloc(&mlp, size_t(rows) * HIDDEN);
     alloc(&gate, size_t(rows) * GATEUP);
     alloc(&act, size_t(rows) * INTERMEDIATE);  alloc(&out, size_t(rows) * HIDDEN);
@@ -333,7 +345,11 @@ int main(int argc, char **argv) {
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
-                if (wmma && flash_attn) {
+                if (wmma && narrow_qkv && online_attn) {
+                    // One wave32 per (16 query rows within an image, head).
+                    launchBlock(attn_online.function,
+                                batch * ((TOKENS + 15) / 16), HEADS, 32, args);
+                } else if (wmma && flash_attn) {
                     Kernel &fa = narrow_qkv ? flash16_af16 : (narrow_act ? flash16 : flash);
                     // One workgroup per (32 query rows within an image, head).
                     launch(fa.function, batch * ((TOKENS + attn_tile - 1) / attn_tile), HEADS, args);

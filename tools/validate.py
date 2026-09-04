@@ -54,7 +54,8 @@ def main() -> int:
                         "--weights", str(ROOT / "build/weights"),
                         "--kernels", str(ROOT / "build/kernels"),
                         "--input", "/tmp/validate_patchified.bin",
-                        "--output", "/tmp/loom_validate.bin"], check=True, cwd=ROOT,
+                        "--output", "/tmp/loom_validate.bin"] + sys.argv[1:],
+                       check=True, cwd=ROOT,
                        capture_output=True, env=gpu_env)
         loom = np.fromfile("/tmp/loom_validate.bin", dtype=np.float32).reshape(R.TOKENS, R.HIDDEN)
 
