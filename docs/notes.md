@@ -530,3 +530,59 @@ The one shape that wins, `o`, is 5.4% of the forward pass, so 1.18x there is
 ~0.8% overall -- inside run-to-run variance. Not wired in. The kernel is kept in
 `experiments/` because the *next* shape someone tries may have the arithmetic
 intensity to pay for the registers.
+
+## Lever 7: tuning occupancy for gfx1151 -- the kernels were already on the peak
+
+The Radeon 8060S (gfx1151) gives a CU **64 KB of LDS**, **1536 VGPRs per SIMD**
+(two SIMD32 per CU) and caps it at **32 waves**. So full occupancy needs
+<= 96 VGPRs per wave and <= 16 KB of LDS per 256-thread workgroup. An audit of
+every kernel against both budgets:
+
+| kernel | VGPR | LDS | waves/CU | limited by |
+| --- | ---: | ---: | ---: | --- |
+| wmma_swiglu_k384_n1536 | 88 | 31744 | 16 (50%) | LDS |
+| wmma matmuls (all) | 64 | 18432 | 24 (75%) | LDS |
+| attention_online_cf16 | 168 | 4608 | 14 (43%) | LDS/slots |
+| layernorm, rope, residual, scatter | <=16 | <=2048 | 32 (100%) | - |
+
+**Nothing is VGPR-limited.** Every kernel has register budget to spare while LDS
+holds occupancy down, which looks like an obvious imbalance to fix.
+
+It is not. The three LDS allocations in each matmul -- A stage, W stage, result
+stage -- have disjoint lifetimes: A and W are dead once the k-loop's last
+workgroup barrier retires, which is exactly when the result tiles come alive.
+Laying them over one arena takes the matmuls 18432 -> 10240 B and the SwiGLU
+kernel 31744 -> 16384 B, both to a full 32 waves/CU. Correctness holds (cosine
+1.00000000, model 0.99998).
+
+**Every matmul stage got slower.** At batch 32, profiled: down 176.5 -> 254.1 ms,
+o 44.0 -> 61.1, qkv 105.3 -> 133.9, gate/up 244.5 -> 278.9.
+
+Sweeping the LDS arena to control occupancy directly shows why -- the optimum is
+interior, and the shipped configuration is sitting on it:
+
+| LDS/wg | workgroups/CU | waves/CU | down | qkv | o |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10240 | 4 (capped) | 32 | 237.8 | 123.1 | 57.8 |
+| 16384 | 4 | 32 | 249.3 | 129.7 | 58.5 |
+| **21504** | **3** | **24** | **183.5** | **105.1** | **42.6** |
+| 32768 | 2 | 16 | 299.9 | 151.1 | 65.3 |
+| 65536 | 1 | 8 | 385.6 | 210.4 | 82.5 |
+
+Both directions cost roughly 2x at the extremes. 24 waves/CU is enough to hide
+latency; past that, the extra concurrent workgroups are extra concurrent global
+streams competing for 32 KB of L1 and 2 MB of L2, and the streaming footprint per
+CU is what actually binds. The 18432 B the kernels already used lands on 3
+workgroups/CU.
+
+Moving the SwiGLU kernel from its 2 workgroups/CU to 3 (arena padded to 21504)
+looked promising on a single reading (227.1 vs 244.5 ms) but was 0.98x on the
+stage and 0.92x overall over best-of-5 interleaved. That first number was an
+outlier; the machine had a 10-core CPU job on it throughout, which widens the
+spread on end-to-end timing enough to fool a single sample.
+
+**Reverted, nothing shipped.** The useful output is the sweep: for this repo's
+matmul shape on gfx1151 the target is *3 workgroups per CU*, not maximum
+occupancy, and there is ~21.5 KB of LDS available at that occupancy against the
+18.4 KB currently used. Spending that 3 KB on a deeper k-block, rather than on
+more workgroups, is the version of this idea that has not been tried.
