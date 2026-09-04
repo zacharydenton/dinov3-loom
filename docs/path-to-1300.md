@@ -101,3 +101,77 @@ inductor calls rather than generates. Matching it means writing a genuinely good
 flash attention, which is the hardest kernel in this model. The matmul side of
 this repo is already competitive; the attention side is a real project, not a
 tuning pass.
+
+## What `~/code/hrx-demos` changes about all of this
+
+`ROCm/hrx-demos` is a complete Ideogram 4 text-to-image implementation on HRX
+with **255 Loom kernels** -- unlike `hrx-loom-kernels`, which has eight. It is the
+reference for how AMD actually writes these, and it contradicts the central
+assumption of this repo.
+
+### Their WMMA kernels use no LDS at all
+
+`kernels/ideogram4/linear_bf16_bf16_wmma_m128n64_2wave.loom` has **zero**
+`buffer.alloca`. Both fragments load straight from global views:
+
+```
+%lhs = vector.fragment.load<lhs> %input_view[...]
+%rhs = vector.fragment.load<rhs> %weight_view[...]
+```
+
+The `rhs` transpose is a strided *view* over the global weight buffer
+(`encoding.layout.strided [1, %hidden_size]`), not a staged copy. They also
+declare `buffer.assume.alignment {minimum_alignment = 16}` so the compiler can
+issue wide loads.
+
+Every kernel here stages A and W through LDS with barriers. That machinery -- and
+the double-buffering, tile-widening and prefetch experiments that all failed
+around it -- exists to solve a problem their kernels do not have.
+
+**But the naive version of this is worse, and it is worth knowing why.** A no-LDS
+16x16 tile with one wave, measured on the model's shapes:
+
+| shape (M=6432) | no-LDS 16x16 | this repo, LDS-staged 64x64 |
+| --- | ---: | ---: |
+| qkv (K=384, N=1152) | 8.57 TFLOP/s | **18.79** |
+| gate/up (K=384, N=3072) | 6.95 | **16.92** |
+| down (K=1536, N=384) | 5.35 | **13.26** |
+
+At a 16x16 tile, A is re-read N/16 times and W is re-read M/16 times, and nothing
+recovers that. AMD's shape is **128x64 across two waves** -- 8192 outputs over 64
+lanes is 128 accumulators per lane, sixteen fragments. The reuse comes from *the
+register tile*, not from LDS. That is the technique: make the register block big
+enough that operands are read once and held, and skip the staging entirely.
+
+### They ship the attention kernel this repo needs
+
+`kernels/ideogram4/attention_online_bf16_wmma.loom` is online-softmax
+FlashAttention in 301 lines:
+
+* **One wave32 per workgroup**, `workgroup_size(32)`, one 16-query tile per head.
+* **512 bytes of LDS**, used only to exchange probabilities. No K/V staging.
+* K and V fragment-load from global; K's transpose is a strided view.
+* Twenty loop-carried `vector<8xf32>` values -- running max and sum split across
+  even/odd lane groups, plus sixteen accumulator fragments -- held in registers
+  across the whole key loop.
+* Query tokens padded to a multiple of 16 so every tile is whole and no bounds
+  guard is needed in the inner loop.
+
+That is the 5x. It is not a tuning pass, but it is also not research: the design
+is sitting in `~/code/hrx-demos` and it targets gfx1100, one revision of the same
+architecture.
+
+### Revised plan
+
+1. **Port the online attention shape.** One wave per (16 queries, head), K/V from
+   global, online softmax in registers, LDS only for the probability exchange.
+   head_size is 64 here rather than 256, so the QK inner loop is 4 head tiles and
+   the accumulator is 4 fragments -- smaller than theirs. Attention is 36% of the
+   time at 1.88 TFLOP/s; anything above 12 clears the target on its own.
+2. **Re-do the matmul as a large register tile with no LDS**, m128n64 over two
+   waves. This repo is at 13-19 TFLOP/s with LDS staging; the question is whether
+   their shape beats it. Given that all three of the failed experiments here were
+   LDS-and-occupancy problems, it probably does.
+3. **fp8.** Ideogram 4 runs fp8 weights (`linear_fp8_bf16_wmma*`), which would
+   halve weight traffic again. DINOv3 weights would very likely tolerate it at
+   the 0.997 gate this model is judged by.
