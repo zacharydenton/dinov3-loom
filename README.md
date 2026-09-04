@@ -43,7 +43,7 @@ Complete forward pass, validated, benchmarked. Six kernels:
 | `swiglu_f32` | `silu(gate) * up` — the "+" in ViT-S+ |
 | `residual_scale_f32` | LayerScale and residual fused, in place on the stream |
 
-`host/dinov3` chains them into the 12-layer model: 170 launches per image,
+`host/dinov3` chains them into the 12-layer model: 87 launches per image,
 weights uploaded once, patch extraction on the host (16x16 stride 16 is a pure
 reshape). All nine kernel configurations compile in **106 ms total**.
 
@@ -110,23 +110,31 @@ Read it honestly:
   the down projection 22.3%. Attention, which used to be 36.4%, is 10.2%.
 
 Accuracy: cosine **0.99998** against transformers on the full fp16 path (f16
-weights, f16 matmul-facing activations, f16 attention probabilities, f32
-accumulation throughout). The pure f32 path is exact to ten digits. xdna-vision
-gates DINOv3 at 0.997. `--f32`, `--no-flash`, `--f32-act`, `--f32-qkv` and
-`--no-online-attn` select the slower, more accurate paths independently.
+weights, f16 activations, f16 attention probabilities, f16 residual stream, f32
+accumulation throughout). xdna-vision gates DINOv3 at 0.997.
 
-Where the time goes at batch 32, everything on:
+There is **one inference path**. Earlier revisions carried f32, non-fused and
+non-WMMA fallbacks behind flags; they multiplied the dtype and layout
+combinations far past what was tested, and several combinations were silently
+wrong. The runner now takes only `--weights`, `--kernels`, `--input`,
+`--output`, `--batch`, `--repeat` and `--profile`.
+
+Where the time goes at batch 32:
 
 ```
-gate/up matmul + swiglu  30.1%
-down matmul              22.3%
-residual+norm            13.2%
-qkv matmul               12.9%
-attention                10.2%
-o matmul                  5.4%
-rope                      2.9%
-patch embed               1.6%
+gate/up matmul + swiglu  35.4%
+down matmul + residual   24.1%
+qkv matmul + rope        16.3%
+attention                12.9%
+o matmul + residual       6.3%
+layernorm                 3.0%
+patch embed               1.7%
+embed scatter             0.3%
 ```
+
+Every elementwise stage except LayerNorm has been fused into the matmul that
+produces its input: RoPE into the qkv epilogue, SwiGLU into gate/up, the
+residual add and LayerScale into o and down.
 
 The run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 (f32) -> 468 (WMMA) -> 667
 (flash attention) -> 758 (f16 activations) -> 915 (kernel fusion) -> 1303
@@ -135,7 +143,7 @@ The run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 (f32) -> 468 (WMMA) -> 667
 ## Layout
 
 ```
-kernels/    .loom sources, one op per file, each with check.case blocks
+kernels/    .loom sources for the eleven kernels the model launches
 host/       loomrun.cpp — launches one compiled kernel and dumps its buffers
 tools/      Python drivers: compile, run, compare against NumPy f64
 scripts/    env.sh (toolchain + runtime paths), test.sh
@@ -144,27 +152,40 @@ docs/       notes.md — the compiler and ABI landmines found so far
 
 ## Running it
 
+Needs the Loom toolchain from [ROCm/hrx-system](https://github.com/ROCm/hrx-system)
+(`scripts/env.sh` points at the build) and ROCm for `hipcc`. Python dependencies
+are in `requirements.txt`; the model is fetched from the Hub on first use, or set
+`DINOV3_SNAPSHOT` to an existing snapshot directory.
+
 ```console
+$ pip install -r requirements.txt
 $ source scripts/env.sh
 $ python3 tools/export_weights.py          # 115 MB blob + manifest
-$ ./scripts/build_kernels.sh               # nine HSACOs, ~106 ms
+$ ./scripts/build_kernels.sh               # eleven HSACOs
 $ /opt/rocm/bin/hipcc -O2 -o host/dinov3 host/dinov3.cpp
 $ /opt/rocm/bin/hipcc -O2 -o host/loomrun host/loomrun.cpp
 
-$ python3 tools/validate.py                # vs HF transformers
+$ ./scripts/test.sh                        # kernels, error paths, end-to-end
+$ ./host/dinov3 --input build/patchified.bin --batch 32 --repeat 40
+{"batch": 32, "images": 1280, "total_ms": 907.125, "ms_per_image": 0.7087, "img_per_s": 1411.05}
 $ python3 tools/benchmark.py               # vs torch, interleaved
-$ ./host/dinov3 --input build/patchified.bin --repeat 30
-{"images": 30, "total_ms": 319.304, "ms_per_image": 10.643, "img_per_s": 93.95}
-$ ./host/dinov3 --input build/patchified.bin --repeat 15 --profile
 ```
 
-Per-kernel tests go through `host/loomrun`, which launches one compiled HSACO
-and dumps its buffers: `python3 tools/test_matmul.py`, `tools/test_layernorm.py`,
-`tools/test_kernels.py`. Each compares against float64 NumPy.
+`scripts/test.sh` is the one test command: it builds the kernels, checks the
+generated kernel still matches its generator, runs every unit test, exercises
+the runners' error paths, and finishes with the end-to-end comparison against
+transformers. `--quick` skips the last step, which is the only one needing
+torch.
 
-Prerequisites: a built `hrx-system` (`$HRX_BUILD`, default `~/code/hrx-system/build-cuda`)
-and a working ROCm. On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts
-under HRX and `scripts/env.sh` shims around it.
+Per-kernel tests go through `host/loomrun`, which launches one compiled HSACO
+and dumps its buffers — `tools/test_layernorm.py`, `tools/test_matmul_wmma.py`,
+`tools/test_fused_matmuls.py`, `tools/test_attention_online.py`. Each compares
+against float64 NumPy from `tools/reference.py`, which is written independently
+of the kernels and agrees with transformers to 9.3e-06, so a kernel bug cannot
+hide behind a matching bug in the harness.
+
+On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts under HRX and
+`scripts/env.sh` shims around it.
 
 ## Two things that will bite you
 
@@ -177,4 +198,4 @@ under HRX and `scripts/env.sh` shims around it.
 
 ## Licence
 
-Apache-2.0, matching hrx-system.
+Apache-2.0, matching hrx-system. Full text in [LICENSE](LICENSE).

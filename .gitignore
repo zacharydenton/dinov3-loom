@@ -1,5 +1,6 @@
 build/
+host/dinov3
 host/loomrun
-*.hsaco
-*.bin
+experiments/rocwmma_gemm
 __pycache__/
+*.pyc

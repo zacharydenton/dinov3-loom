@@ -34,8 +34,10 @@ def main() -> int:
             # kernel masks those lanes but still forms the address, so the
             # buffers carry 16 rows of headroom.
             padded = rows + 16
-            qkv = rng.standard_normal((padded, stride), dtype=np.float32).astype(np.float16)
-            q, k, v = (np.ascontiguousarray(qkv) for _ in range(3))
+            # Distinct q, k and v: identical buffers would hide a swapped or
+            # mis-strided pointer, which is exactly what this test should catch.
+            q, k, v = (rng.standard_normal((padded, stride), dtype=np.float32).astype(np.float16)
+                       for _ in range(3))
             args = [("i32", rows), ("in_f16", q), ("in_f16", k), ("in_f16", v),
                     ("out", ((rows, HID), np.float32))]
             grid = (batch * ((T + 15) // 16), H, 1)

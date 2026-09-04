@@ -67,7 +67,9 @@ def main() -> int:
         cls = cosine(loom[0], hf[0])
         mean = cosine(loom[R.PREFIX:].mean(0), hf[R.PREFIX:].mean(0))
         max_abs = np.abs(loom.astype(np.float64) - hf.astype(np.float64)).max()
-        good = cls > 0.9999 and mean > 0.9999
+        # Gate on the full output too: CLS and the patch mean can both look
+        # healthy while individual patch tokens are wrong.
+        good = full > 0.9999 and cls > 0.9999 and mean > 0.9999
         ok &= good
         print(f"  {'PASS' if good else 'FAIL'} image {seed}: "
               f"cosine full={full:.10f} cls={cls:.10f} mean-patch={mean:.10f} "

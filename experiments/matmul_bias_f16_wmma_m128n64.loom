@@ -149,7 +149,6 @@ kernel.def target(@dinov3_matmul_m128n64_gfx11) export("dinov3_matmul_bias_f16_w
   // (row, column) coordinates. 16x64 is 256 vector4s over 32 lanes, eight each.
   // The row stride is padded 64 -> 68 to keep the banks apart and every vector4
   // 16-byte aligned.
-
   vector.fragment.store<result> %result00, %stage_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
   vector.fragment.store<result> %result01, %stage_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x68xf32>
   vector.fragment.store<result> %result02, %stage_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x68xf32>

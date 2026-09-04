@@ -1,4 +1,3 @@
-// VARIANT of layernorm_rowwave_f16 with an f32 output, for the final norm.
 // LayerNorm with one row per *wave* instead of one row per workgroup.
 //
 // The workgroup version needed a cross-wave reduction: LDS scratch, two
@@ -10,13 +9,16 @@
 // hidden_size must be a multiple of 128 so that 32 lanes x vector4 tiles it
 // exactly; at 384 each lane holds three vector4s, twelve channels, in registers.
 
-amdgpu.target<gfx11-generic> @dinov3_layernorm_rowwave_f32out_gfx11 {subgroup_size = 32}
+amdgpu.target<gfx11-generic> @dinov3_layernorm_rowwave_gfx11 {subgroup_size = 32}
 
-config.decl @dinov3.layernorm_rowwave_f32out.hidden_size : %value: index where [range(%value, 128, 1024), mul(%value, 128)]
+// Three vector4s per lane are held in registers between the two passes,
+// so hidden_size may not exceed 3 x 128. The upper bound is part of the
+// contract, not a convenience: a wider row would silently drop channels.
+config.decl @dinov3.layernorm_rowwave_f16.hidden_size : %value: index where [range(%value, 128, 384), mul(%value, 128)]
 
-config.decl @dinov3.layernorm_rowwave_f32out.epsilon : f32
+config.decl @dinov3.layernorm_rowwave_f16.epsilon : f32
 
-kernel.def target(@dinov3_layernorm_rowwave_f32out_gfx11) export("dinov3_layernorm_rowwave_f32out") @dinov3_layernorm_rowwave_f32out(%token_count: index) {
+kernel.def target(@dinov3_layernorm_rowwave_gfx11) export("dinov3_layernorm_rowwave_f16") @dinov3_layernorm_rowwave_f16(%token_count: index) {
   %c1 = index.constant 1 : index
   %c8 = index.constant 8 : index
   %c7 = index.constant 7 : index
@@ -25,8 +27,8 @@ kernel.def target(@dinov3_layernorm_rowwave_f32out_gfx11) export("dinov3_layerno
   %groups = index.div %rounded, %c8 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%token_count: index, %input: buffer, %gamma: buffer, %beta: buffer, %output: buffer) {
-  %hidden_size = config.get @dinov3.layernorm_rowwave_f32out.hidden_size : index
-  %epsilon = config.get @dinov3.layernorm_rowwave_f32out.epsilon : f32
+  %hidden_size = config.get @dinov3.layernorm_rowwave_f16.hidden_size : index
+  %epsilon = config.get @dinov3.layernorm_rowwave_f16.epsilon : f32
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -55,7 +57,7 @@ kernel.def target(@dinov3_layernorm_rowwave_f32out_gfx11) export("dinov3_layerno
 
   %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
   %input_view = buffer.view %input_noalias[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>
-  %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>
   %gamma_view = buffer.view %gamma[%c0_offset] : buffer -> view<[%hidden_size]xf32>
   %beta_view = buffer.view %beta[%c0_offset] : buffer -> view<[%hidden_size]xf32>
 
@@ -106,7 +108,8 @@ kernel.def target(@dinov3_layernorm_rowwave_f32out_gfx11) export("dinov3_layerno
       %scaled = vector.mulf<reassoc|nnan|ninf|nsz> %centred, %rstd_v : vector<4xf32>
       %weighted = vector.mulf<reassoc|nnan|ninf|nsz> %scaled, %gamma_v : vector<4xf32>
       %result = vector.addf<reassoc|nnan|ninf|nsz> %weighted, %beta_v : vector<4xf32>
-      vector.store %result, %output_view[%row, %channel] : vector<4xf32>, view<[%token_count]x[%hidden_size]xf32>
+      %narrow = vector.fptrunc %result : vector<4xf32> to vector<4xf16>
+      vector.store %narrow, %output_view[%row, %channel] : vector<4xf16>, view<[%token_count]x[%hidden_size]xf16>
     }
   }
   kernel.return

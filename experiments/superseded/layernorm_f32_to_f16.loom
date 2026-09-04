@@ -128,7 +128,7 @@ kernel.def target(@dinov3_layernorm_gfx11_wave32) export("dinov3_layernorm_f32_f
   scf.if %valid_token {
     scf.for %channel = [%workitem to %hidden_size step %c256] {
       %value_half = view.load %input_view[%token, %channel] : view<[%token_count]x[%hidden_size]xf16> -> f16
-    %value = scalar.extf %value_half : f16 to f32
+      %value = scalar.extf %value_half : f16 to f32
       %scale = view.load %gamma_view[%channel] : view<[%hidden_size]xf32> -> f32
       %shift = view.load %beta_view[%channel] : view<[%hidden_size]xf32> -> f32
       %centered = scalar.subf<reassoc|nnan|ninf|nsz> %value, %mean : f32

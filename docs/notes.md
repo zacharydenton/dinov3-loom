@@ -922,3 +922,61 @@ is not being done.
 The diagnostics are the useful output: attention is **K/V-bandwidth-bound at
 large batch and softmax-latency-bound at small batch**, which are different
 problems wanting different kernels, and neither is barrier-bound.
+
+## Release review response
+
+An external review of `41c884c` found several out-of-bounds accesses, broken
+option combinations, and licensing/reproducibility gaps. What changed:
+
+**`embed_scatter` read past the prefix tensor.** Both sources were declared
+`token_count x hidden` and loaded unconditionally before selecting, but the
+prefix is only 5 rows. In the integrated model the stray read landed inside the
+weight blob and the value was discarded, so validation never saw it. Both views
+now carry their real extents and an `scf.if` loads only the selected source.
+
+**`loomrun` had two stack overflows.** The argument-count check ran *after* the
+store, so the 33rd argument was written past `args[]`; and `--out path:bytes`
+passed the path *length* as `snprintf`'s buffer capacity. Both now check before
+writing, and an over-long path is refused rather than truncated.
+
+**The option matrix was mostly untested and partly wrong.** `--no-flash` was
+ignored while online attention was on; `--no-online-attn --no-flash` fed f16
+q/k/v to the f32 scalar kernel; `--attn-tile 32` launched half the workgroups
+against a kernel fixed at 16 rows, giving cosine 0.23; `--f32-act` disagreed with
+`narrow_qkv`; and `--no-fuse-norm` never emitted the next layer's norm1, so every
+later layer read stale activations. Rather than fix nine interacting booleans,
+**there is now one inference path** -- the measured-best one. The runner takes
+only `--weights`, `--kernels`, `--input`, `--output`, `--batch`, `--repeat` and
+`--profile`. That took `host/dinov3.cpp` from 654 lines to 411, the kernel set
+from 38 HSACOs to 11, and removed the whole class of bug.
+
+**Input was unvalidated.** `--batch` with no value aborted in the C++ runtime;
+`--input` was optional, so omitting it launched on uninitialised memory, and a
+short file caused an oversized host-to-device read; manifest spans were never
+checked against the blob; and batches above the kernels' compiled `max_images`
+of 64 silently folded later images onto earlier ones. All now rejected with a
+diagnostic, and `scripts/test.sh` asserts each one.
+
+**Two shipped kernels advertised shapes they could not compute.** The row-per-
+wave LayerNorm holds three vector4s in registers, so hidden_size above 384 would
+have dropped channels, yet the contract allowed 1024. The fused RoPE epilogue
+assumes a head is exactly as wide as the 64-wide n-tile, yet head_dim allowed
+16-512. Both contracts now reject the shapes that would miscompute; verified by
+compiling the bad configurations and checking they fail.
+
+**The rocWMMA benchmark did GPU OOB.** It guarded `row >= m` while every
+fragment op touches 16 rows, so an m=804 problem read through row 815. The guard
+now covers the whole tile, `main` propagates `run()`'s status, and the row count
+is rounded to a fragment multiple so no tail is skipped.
+
+Also: Apache-2.0 text added; the model resolves through `huggingface_hub` with a
+`DINOV3_SNAPSHOT` override instead of a hard-coded path into a home directory;
+`requirements.txt` records the verified versions; tracked build outputs and empty
+`package.json` removed; `validate.py` now gates on the full-output cosine and not
+only CLS and patch-mean; the online-attention test uses distinct q/k/v so a
+swapped pointer cannot pass; every `.loom` file is canonically formatted and
+`scripts/test.sh` checks it.
+
+`scripts/test.sh` is the single entry point: format, build, generator
+reproducibility, four unit suites against float64 NumPy, the runners' error
+paths, and the end-to-end comparison against transformers.

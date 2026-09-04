@@ -1,0 +1,10 @@
+# Versions this repository's results were produced and verified with. Lower
+# bounds rather than pins: nothing here depends on a specific patch release.
+numpy>=2.3            # verified with 2.5.2
+safetensors>=0.6      # verified with 0.8.0
+huggingface_hub>=0.34 # verified with 1.29.0; resolves the model snapshot
+
+# Only tools/validate.py, tools/benchmark.py and tools/bench_torch.py need these.
+# The kernels, host/dinov3, host/loomrun and tools/reference.py do not.
+torch>=2.9            # verified with 2.13.0+rocm
+transformers>=5.0     # verified with 5.7.0.dev0

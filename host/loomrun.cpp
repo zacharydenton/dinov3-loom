@@ -47,6 +47,17 @@ static size_t kernarg_append(unsigned char *buf, size_t offset, const void *src,
     return offset + size;
 }
 
+// Copy at most `take` bytes of `src` into a `cap`-byte destination, refusing
+// rather than truncating: a truncated path would name the wrong file.
+static int copy_path(char *dst, size_t cap, const char *src, size_t take) {
+    size_t len = strnlen(src, take == (size_t)-1 ? cap : take);
+    if (take != (size_t)-1 && len > take) len = take;
+    if (len >= cap) { fprintf(stderr, "path too long (max %zu)\n", cap - 1); return 0; }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *hsaco = NULL, *kernel = NULL;
     unsigned grid[3] = {1, 1, 1}, block[3] = {1, 1, 1};
@@ -56,6 +67,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         #define NEXT() (i + 1 < argc ? argv[++i] : (fprintf(stderr, "%s needs a value\n", a), exit(64), (char*)""))
+        // Claim the slot *before* writing it: checking after the store already
+        // wrote past the end of args[] for the MAX_ARGS+1'th argument.
+        #define SLOT() (arg_count < MAX_ARGS ? arg_count \
+                        : (fprintf(stderr, "too many args (max %d)\n", MAX_ARGS), exit(64), 0))
         if      (!strcmp(a, "--hsaco"))  hsaco = NEXT();
         else if (!strcmp(a, "--kernel")) kernel = NEXT();
         else if (!strcmp(a, "--grid"))   sscanf(NEXT(), "%u,%u,%u", &grid[0], &grid[1], &grid[2]);
@@ -63,33 +78,35 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--repeat")) repeat = atoi(NEXT());
         else if (!strcmp(a, "--verbose")) verbose = 1;
         else if (!strcmp(a, "--i32")) {
-            args[arg_count].kind = ARG_I32;
+            args[SLOT()].kind = ARG_I32;
             args[arg_count].scalar.i32 = atoi(NEXT());
             arg_count++;
         } else if (!strcmp(a, "--f32")) {
-            args[arg_count].kind = ARG_F32;
+            args[SLOT()].kind = ARG_F32;
             args[arg_count].scalar.f32 = (float)atof(NEXT());
             arg_count++;
         } else if (!strcmp(a, "--in")) {
-            args[arg_count].kind = ARG_BUFFER; args[arg_count].is_output = 0;
-            snprintf(args[arg_count].path, sizeof(args[arg_count].path), "%s", NEXT());
+            args[SLOT()].kind = ARG_BUFFER; args[arg_count].is_output = 0;
+            if (!copy_path(args[arg_count].path, sizeof(args[arg_count].path), NEXT(), (size_t)-1)) return 64;
             arg_count++;
         } else if (!strcmp(a, "--inout")) {
             // --inout path — uploaded, then written back after the launch.
-            args[arg_count].kind = ARG_BUFFER; args[arg_count].is_output = 2;
-            snprintf(args[arg_count].path, sizeof(args[arg_count].path), "%s", NEXT());
+            args[SLOT()].kind = ARG_BUFFER; args[arg_count].is_output = 2;
+            if (!copy_path(args[arg_count].path, sizeof(args[arg_count].path), NEXT(), (size_t)-1)) return 64;
             arg_count++;
         } else if (!strcmp(a, "--out")) {
             // --out path:bytes
             const char *spec = NEXT();
             const char *colon = strrchr(spec, ':');
             if (!colon) { fprintf(stderr, "--out wants path:bytes\n"); return 64; }
-            args[arg_count].kind = ARG_BUFFER; args[arg_count].is_output = 1;
-            snprintf(args[arg_count].path, (size_t)(colon - spec) + 1, "%s", spec);
+            args[SLOT()].kind = ARG_BUFFER; args[arg_count].is_output = 1;
+            // (colon - spec) is the path *length*, not the buffer capacity; it
+            // was being passed as snprintf's size and would overflow path[].
+            if (!copy_path(args[arg_count].path, sizeof(args[arg_count].path), spec,
+                           (size_t)(colon - spec))) return 64;
             args[arg_count].bytes = strtoull(colon + 1, NULL, 10);
             arg_count++;
         } else { fprintf(stderr, "unknown option %s\n", a); return 64; }
-        if (arg_count > MAX_ARGS) { fprintf(stderr, "too many args\n"); return 64; }
     }
     if (!hsaco || !kernel) { fprintf(stderr, "need --hsaco and --kernel\n"); return 64; }
 

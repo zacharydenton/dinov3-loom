@@ -6,15 +6,36 @@ kernels are graded against.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 from safetensors.numpy import load_file
 
-SNAPSHOT = Path(
-    "/home/zach/.cache/huggingface/hub/models--facebook--dinov3-vits16plus-pretrain-lvd1689m"
-    "/snapshots/c93d816fc9e567563bc068f01475bec89cc634a6"
-)
+MODEL_ID = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
+
+
+def _snapshot() -> Path:
+    """Locate the model, downloading it on first use.
+
+    DINOV3_SNAPSHOT overrides, for offline or vendored copies. Otherwise this
+    resolves through huggingface_hub, which caches under HF_HOME.
+    """
+    override = os.environ.get("DINOV3_SNAPSHOT")
+    if override:
+        return Path(override)
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:  # pragma: no cover - dependency guidance
+        raise SystemExit(
+            "huggingface_hub is required to resolve the model. Install the "
+            "dependencies (pip install -r requirements.txt), or point "
+            "DINOV3_SNAPSHOT at an existing snapshot directory."
+        )
+    return Path(snapshot_download(MODEL_ID))
+
+
+SNAPSHOT = _snapshot()
 
 HIDDEN = 384
 HEADS = 6

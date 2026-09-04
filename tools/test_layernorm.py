@@ -1,4 +1,4 @@
-"""LayerNorm kernel vs a float64 NumPy reference."""
+"""layernorm_rowwave_f16 vs a float64 NumPy reference."""
 import sys
 from pathlib import Path
 
@@ -17,10 +17,10 @@ def main() -> int:
     with workdir() as tmp:
         tmp = Path(tmp)
         hsaco = tmp / "layernorm.hsaco"
-        compile_kernel(ROOT / "kernels/layernorm_f32.loom", "dinov3_layernorm_f32",
-                       {"dinov3.layernorm_f32.hidden_size": HIDDEN,
-                        "dinov3.layernorm_f32.epsilon": EPS}, hsaco)
-        print(f"compiled layernorm_f32 for hidden={HIDDEN}")
+        compile_kernel(ROOT / "kernels/layernorm_rowwave_f16.loom", "dinov3_layernorm_rowwave_f16",
+                       {"dinov3.layernorm_rowwave_f16.hidden_size": HIDDEN,
+                        "dinov3.layernorm_rowwave_f16.epsilon": EPS}, hsaco)
+        print(f"compiled layernorm_rowwave_f16 for hidden={HIDDEN}")
         rng = np.random.default_rng(0)
         for tokens in CASES:
             # layernorm reads the residual stream, which is f16.
@@ -28,9 +28,9 @@ def main() -> int:
             gamma = rng.standard_normal(HIDDEN, dtype=np.float32)
             beta = rng.standard_normal(HIDDEN, dtype=np.float32)
             (y,), timing = launch(
-                hsaco, "dinov3_layernorm_f32", (tokens, 1, 1), (256, 1, 1),
+                hsaco, "dinov3_layernorm_rowwave_f16", ((tokens + 7) // 8, 1, 1), (256, 1, 1),
                 [("i32", tokens), ("in_f16", x), ("in", gamma), ("in", beta),
-                 ("out", ((tokens, HIDDEN), np.float32))],
+                 ("out_f16", ((tokens, HIDDEN), np.float16))],
                 tmp, repeat=50)
             xd = x.astype(np.float64)
             mean = xd.mean(axis=1, keepdims=True)

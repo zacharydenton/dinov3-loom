@@ -88,10 +88,10 @@ kernel.def target(@dinov3_residual_layernorm_gfx11) export("dinov3_residual_laye
 
   scf.if %valid {
     %updated0_h = scalar.fptrunc %updated0 : f32 to f16
-  view.store %updated0_h, %x_view[%token, %channel0] : f16, view<[%token_count]x[%hidden_size]xf16>
+    view.store %updated0_h, %x_view[%token, %channel0] : f16, view<[%token_count]x[%hidden_size]xf16>
     scf.if %has_second {
       %updated1_h = scalar.fptrunc %updated1 : f32 to f16
-  view.store %updated1_h, %x_view[%token, %channel1] : f16, view<[%token_count]x[%hidden_size]xf16>
+      view.store %updated1_h, %x_view[%token, %channel1] : f16, view<[%token_count]x[%hidden_size]xf16>
     }
   }
 

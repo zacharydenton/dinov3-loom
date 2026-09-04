@@ -41,7 +41,10 @@ __global__ __launch_bounds__(256) void wmma_gemm(const float16_t *__restrict__ a
     const int wave_n = wave % WAVES_N;
     const int row = blockIdx.y * TILE_M + wave_m * WMMA;
     const int col = blockIdx.x * TILE_N + wave_n * WMMA;
-    if (row >= m || col >= n) return;
+    // Each fragment op touches WMMA rows and columns from (row, col), so the
+    // guard has to cover the whole tile, not just its origin: `row >= m` let a
+    // tile starting at row 800 of an m=804 problem read through row 815.
+    if (row + WMMA > m || col + WMMA > n) return;
 
     rocwmma::fragment<accumulator, WMMA, WMMA, WMMA, float32_t> acc;
     rocwmma::fill_fragment(acc, 0.0f);
@@ -123,11 +126,15 @@ static int run(const char *name, int m, int k, int n, int repeat) {
 int main(int argc, char **argv) {
     const int batch = argc > 1 ? atoi(argv[1]) : 32;
     verbose = argc > 2;
-    const int rows = batch * 201;
+    // Rounded up to a whole fragment: the kernel now skips any tile that would
+    // overhang, so a non-multiple of WMMA would leave the tail uncomputed and
+    // quietly report a wrong error figure.
+    const int rows = (batch * 201 + WMMA - 1) / WMMA * WMMA;
     printf("rocWMMA fp16 (f32 accumulate), gfx1151, batch %d -> M=%d\n", batch, rows);
-    run("qkv       ", rows, 384, 1152, 50);
-    run("o         ", rows, 384, 384, 50);
-    run("gate/up   ", rows, 384, 3072, 50);
-    run("down      ", rows, 1536, 384, 50);
-    return 0;
+    int status = 0;
+    status |= run("qkv       ", rows, 384, 1152, 50);
+    status |= run("o         ", rows, 384, 384, 50);
+    status |= run("gate/up   ", rows, 384, 3072, 50);
+    status |= run("down      ", rows, 1536, 384, 50);
+    return status;
 }

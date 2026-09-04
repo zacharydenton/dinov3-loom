@@ -49,27 +49,27 @@ kernel.def target(@dinov3_splitk_reduce_gfx11) export("dinov3_splitk_reduce_f16"
   // not visible to the subrange analysis without saying so.
   %column_limit = index.sub %n_size, %c4 : index
   scf.if %token_valid {
-  %token = index.assume %token_raw [lt(%token_raw, %token_bounded)] : index
-  scf.for %column0 = [%lane_column to %n_size step %c1024] {
-    %column = index.assume %column0 [le(%column0, %column_limit)] : index
-    %total = scf.for %split = [%c0 to %splits step %c1](%running = %zero : vector<4xf32>) -> (vector<4xf32>) {
-      %slab = index.mul %split, %token_bounded : index
-      %row0 = index.add %slab, %token : index
-      %row = index.assume %row0 [lt(%row0, %partial_rows)] : index
-      %values = vector.load %partials_view[%row, %column] : view<[%partial_rows]x[%n_size]xf32> -> vector<4xf32>
-      %next = vector.addf %running, %values : vector<4xf32>
-      scf.yield %next : vector<4xf32>
+    %token = index.assume %token_raw [lt(%token_raw, %token_bounded)] : index
+    scf.for %column0 = [%lane_column to %n_size step %c1024] {
+      %column = index.assume %column0 [le(%column0, %column_limit)] : index
+      %total = scf.for %split = [%c0 to %splits step %c1](%running = %zero : vector<4xf32>) -> (vector<4xf32>) {
+        %slab = index.mul %split, %token_bounded : index
+        %row0 = index.add %slab, %token : index
+        %row = index.assume %row0 [lt(%row0, %partial_rows)] : index
+        %values = vector.load %partials_view[%row, %column] : view<[%partial_rows]x[%n_size]xf32> -> vector<4xf32>
+        %next = vector.addf %running, %values : vector<4xf32>
+        scf.yield %next : vector<4xf32>
+      }
+      %bias_values = vector.load %bias_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
+      %biased = vector.addf %total, %bias_values : vector<4xf32>
+      %lambda_values = vector.load %lambda_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
+      %prior_half = vector.load %out_view[%token, %column] : view<[%token_bounded]x[%n_size]xf16> -> vector<4xf16>
+      %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
+      %scaled = vector.mulf %biased, %lambda_values : vector<4xf32>
+      %updated = vector.addf %prior, %scaled : vector<4xf32>
+      %narrow = vector.fptrunc %updated : vector<4xf32> to vector<4xf16>
+      vector.store %narrow, %out_view[%token, %column] : vector<4xf16>, view<[%token_bounded]x[%n_size]xf16>
     }
-    %bias_values = vector.load %bias_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
-    %biased = vector.addf %total, %bias_values : vector<4xf32>
-    %lambda_values = vector.load %lambda_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
-    %prior_half = vector.load %out_view[%token, %column] : view<[%token_bounded]x[%n_size]xf16> -> vector<4xf16>
-    %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
-    %scaled = vector.mulf %biased, %lambda_values : vector<4xf32>
-    %updated = vector.addf %prior, %scaled : vector<4xf32>
-    %narrow = vector.fptrunc %updated : vector<4xf32> to vector<4xf16>
-    vector.store %narrow, %out_view[%token, %column] : vector<4xf16>, view<[%token_bounded]x[%n_size]xf16>
-  }
   }
   kernel.return
 }

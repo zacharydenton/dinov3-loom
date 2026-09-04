@@ -27,11 +27,15 @@
 
 amdgpu.target<gfx11-generic> @dinov3_matmul_splitk_gfx11 {subgroup_size = 32}
 
-config.decl @dinov3.matmul_splitk_f16_wmma.k_size : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+// Each split walks k_size/splits in steps of 32, so k_size must be divisible
+// by 32*splits. `where` cannot relate two configs, so the stronger bound is
+// put on k_size (128 covers splits of 1, 2 and 4) and splits is restricted
+// to those values; scripts/build_kernels.sh is the only caller.
+config.decl @dinov3.matmul_splitk_f16_wmma.k_size : %value: index where [range(%value, 128, 8192), mul(%value, 128)]
 
 config.decl @dinov3.matmul_splitk_f16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
 
-config.decl @dinov3.matmul_splitk_f16_wmma.splits : %value: index where [range(%value, 1, 16)]
+config.decl @dinov3.matmul_splitk_f16_wmma.splits : %value: index where [range(%value, 1, 4)]
 
 kernel.def target(@dinov3_matmul_splitk_gfx11) export("dinov3_matmul_splitk_f16_wmma") @dinov3_matmul_splitk_f16_wmma(%m_size: index) {
   %c1 = index.constant 1 : index

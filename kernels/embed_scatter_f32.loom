@@ -48,8 +48,20 @@ kernel.def target(@dinov3_embed_scatter_gfx11_wave32) export("dinov3_embed_scatt
   %patches_global = buffer.assume.memory_space<global> %patches : buffer
   %prefix_global = buffer.assume.memory_space<global> %prefix_weights : buffer
   %x_global = buffer.assume.memory_space<global> %x : buffer
-  %patches_view = buffer.view %patches_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
-  %prefix_view = buffer.view %prefix_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  // Both views carry their real extents. The prefix tensor is only `prefix`
+  // rows (CLS + registers), not token_count: declaring it token_count-tall and
+  // loading from it unconditionally read far past the end of the allocation for
+  // every patch row. It happened to land inside the weight blob in the
+  // integrated model and the value was discarded by the select, so validation
+  // never saw it, but as a standalone kernel it is out of bounds.
+  // token_count is an unconstrained launch argument, so the division needs a
+  // width bound. `where` on a launch argument miscompiles here, so bound it
+  // in the body; this value reaches only view extents and view.load.
+  %token_bounded = index.assume %token_count [range(%token_count, 1, 4194304)] : index
+  %images = index.div %token_bounded, %tokens_per_image : index
+  %patch_rows = index.mul %images, %patch_count : index
+  %patches_view = buffer.view %patches_global[%c0_offset] : buffer -> view<[%patch_rows]x[%hidden_size]xf32>
+  %prefix_view = buffer.view %prefix_global[%c0_offset] : buffer -> view<[%prefix]x[%hidden_size]xf32>
   %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>
 
   %is_prefix = index.cmp ult, %in_image, %prefix : index
@@ -59,14 +71,20 @@ kernel.def target(@dinov3_embed_scatter_gfx11_wave32) export("dinov3_embed_scatt
   %patch_offset = index.sub %clamped, %prefix : index
   %image_patch_base = index.mul %image, %patch_count : index
   %patch_row0 = index.add %image_patch_base, %patch_offset : index
-  %source_row0 = scf.select %is_prefix, %in_image, %patch_row0 : index
-  %source_row = index.assume %source_row0 [range(%source_row0, 0, 65536), lt(%source_row0, %token_count)] : index
+  %patch_row = index.assume %patch_row0 [lt(%patch_row0, %patch_rows)] : index
+  %prefix_row = index.assume %in_image [lt(%in_image, %prefix)] : index
 
   scf.if %valid {
     scf.for %channel = [%workitem to %hidden_size step %c256] {
-      %from_prefix = view.load %prefix_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
-      %from_patches = view.load %patches_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
-      %value = scf.select %is_prefix, %from_prefix, %from_patches : f32
+      // Only the selected source is loaded: each row is in range for exactly
+      // one of the two tensors.
+      %value = scf.if %is_prefix -> (f32) {
+        %from_prefix = view.load %prefix_view[%prefix_row, %channel] : view<[%prefix]x[%hidden_size]xf32> -> f32
+        scf.yield %from_prefix : f32
+      } else {
+        %from_patches = view.load %patches_view[%patch_row, %channel] : view<[%patch_rows]x[%hidden_size]xf32> -> f32
+        scf.yield %from_patches : f32
+      }
       %value_half = scalar.fptrunc %value : f32 to f16
       view.store %value_half, %x_view[%token, %channel] : f16, view<[%token_count]x[%hidden_size]xf16>
     }

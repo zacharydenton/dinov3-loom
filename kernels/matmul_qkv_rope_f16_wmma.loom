@@ -29,7 +29,11 @@ config.decl @dinov3.matmul_qkv_rope_f16_wmma.k_size : %value: index where [range
 
 config.decl @dinov3.matmul_qkv_rope_f16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
 
-config.decl @dinov3.matmul_qkv_rope_f16_wmma.head_dim : %value: index where [range(%value, 16, 512), mul(%value, 16)]
+// The epilogue reads cos/sin at the tile column, which equals the channel
+// inside the head only when a head is exactly as wide as the 64-wide n-tile,
+// and pairs channel c with c+32 across the two waves of that tile. Both hold
+// only at head_dim 64.
+config.decl @dinov3.matmul_qkv_rope_f16_wmma.head_dim : %value: index where [range(%value, 64, 64)]
 
 config.decl @dinov3.matmul_qkv_rope_f16_wmma.prefix : %value: index where [range(%value, 0, 64)]
 
@@ -205,7 +209,6 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
     // cos/sin are indexed by the channel inside the head, which for a 64-wide
     // tile aligned to a 64-wide head is exactly out_col_local -- the same table
     // entry for both waves, each read at its own column.
-
     scf.for %half = [%c0 to %c2 step %c1] {
       %row_offset = index.mul %half, %c8 : index
       %publish_row = index.add %publish_row0, %row_offset : index
