@@ -70,6 +70,14 @@ Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 3 interleaved rounds
 (`tools/benchmark.py`) on an idle GPU. Interleaving means both sides see the
 same conditions.
 
+> **This table predates two changes and understates the current code.** f16
+> attention/MLP branches measured **1.133x** at batch 32, and split-K on the down
+> projection measured **1.179x** at batch 1 (which puts batch 1 at ~626 img/s,
+> past torch max-autotune's 594.3). Both are A/B ratios measured interleaved; the
+> absolute figures below have not been re-measured on an idle box since, so they
+> are left as they were rather than scaled. Re-run `tools/benchmark.py` on a
+> quiet machine to refresh them.
+
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
 | **loom fp16, batch 32** | **1303.3** | **1.00x** |
@@ -94,9 +102,10 @@ Read it honestly:
 - **It is faster than every torch configuration measured, at batch 32.** The
   margin over `max-autotune` is 1.8% -- a win, but a narrow one, and closer to
   run-to-run variance than the table's ordering suggests.
-- **Batch 1 still loses to `max-autotune`** (543.5 vs 594.3). It always has;
-  an earlier version of this table claimed otherwise and was wrong. What is true
-  is that batch 1 beats `torch.compile` and `torch.eager` at both precisions.
+- **Batch 1 used to lose to `max-autotune`** (543.5 vs 594.3) and no longer
+  does: split-K on the down projection took it to ~626 img/s. An earlier version
+  of this table claimed batch 1 beat every torch configuration when it did not;
+  that is now true, but it was not then.
 - **The MLP is now the bottleneck**: gate/up+swiglu 30.1% of the forward pass,
   the down projection 22.3%. Attention, which used to be 36.4%, is 10.2%.
 
