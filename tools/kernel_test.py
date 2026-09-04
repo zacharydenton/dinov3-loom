@@ -41,6 +41,12 @@ def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: i
             path = workdir / f"in{index}.bin"
             np.ascontiguousarray(value, dtype=np.float16).tofile(path)
             cmd += ["--in", str(path)]
+        elif kind == "inout_f16":
+            array, shape = value
+            path = workdir / f"io{index}.bin"
+            np.ascontiguousarray(array, dtype=np.float16).tofile(path)
+            cmd += ["--inout", str(path)]
+            outputs.append((path, shape, np.float16))
         elif kind == "inout":
             array, shape = value
             path = workdir / f"io{index}.bin"

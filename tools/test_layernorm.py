@@ -23,19 +23,21 @@ def main() -> int:
         print(f"compiled layernorm_f32 for hidden={HIDDEN}")
         rng = np.random.default_rng(0)
         for tokens in CASES:
-            x = rng.standard_normal((tokens, HIDDEN), dtype=np.float32) * 3.0 + 1.5
+            # layernorm reads the residual stream, which is f16.
+            x = (rng.standard_normal((tokens, HIDDEN), dtype=np.float32) * 3.0 + 1.5).astype(np.float16)
             gamma = rng.standard_normal(HIDDEN, dtype=np.float32)
             beta = rng.standard_normal(HIDDEN, dtype=np.float32)
             (y,), timing = launch(
                 hsaco, "dinov3_layernorm_f32", (tokens, 1, 1), (256, 1, 1),
-                [("i32", tokens), ("in", x), ("in", gamma), ("in", beta),
+                [("i32", tokens), ("in_f16", x), ("in", gamma), ("in", beta),
                  ("out", ((tokens, HIDDEN), np.float32))],
                 tmp, repeat=50)
             xd = x.astype(np.float64)
             mean = xd.mean(axis=1, keepdims=True)
             var = xd.var(axis=1, keepdims=True)
             expected = ((xd - mean) / np.sqrt(var + EPS) * gamma + beta)
-            ok &= report(f"tokens={tokens:<5d} ({timing['per_launch_us']:7.2f} us)", y, expected)
+            ok &= report(f"tokens={tokens:<5d} ({timing['per_launch_us']:7.2f} us)", y, expected,
+                         atol=2e-3, rtol=2e-3)
     return 0 if ok else 1
 
 

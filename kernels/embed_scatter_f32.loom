@@ -1,3 +1,7 @@
+// The residual stream is f16. It is read and written twice per layer and is
+// a third of the model's memory traffic; LayerNorm renormalises it every
+// layer, so the rounding does not compound (cosine is unchanged at
+// 0.99998). See docs/notes.md "Lever 13".
 // Assemble the batched residual stream from the patch-embedding output.
 //
 //   x[i * tokens_per_image + t, :] = prefix[t, :]                        t < prefix_count
@@ -46,7 +50,7 @@ kernel.def target(@dinov3_embed_scatter_gfx11_wave32) export("dinov3_embed_scatt
   %x_global = buffer.assume.memory_space<global> %x : buffer
   %patches_view = buffer.view %patches_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
   %prefix_view = buffer.view %prefix_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
-  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf16>
 
   %is_prefix = index.cmp ult, %in_image, %prefix : index
   // Clamp before subtracting: an unsigned wrap here makes the address range
@@ -63,7 +67,8 @@ kernel.def target(@dinov3_embed_scatter_gfx11_wave32) export("dinov3_embed_scatt
       %from_prefix = view.load %prefix_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
       %from_patches = view.load %patches_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
       %value = scf.select %is_prefix, %from_prefix, %from_patches : f32
-      view.store %value, %x_view[%token, %channel] : f32, view<[%token_count]x[%hidden_size]xf32>
+      %value_half = scalar.fptrunc %value : f32 to f16
+      view.store %value_half, %x_view[%token, %channel] : f16, view<[%token_count]x[%hidden_size]xf16>
     }
   }
   kernel.return

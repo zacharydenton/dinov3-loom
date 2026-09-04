@@ -77,14 +77,17 @@ def main() -> int:
         hsaco = tmp / "residual.hsaco"
         compile_kernel(ROOT / "kernels/residual_scale_f32.loom", "dinov3_residual_scale_f32",
                        {"dinov3.residual_scale_f32.hidden_size": HID}, hsaco)
-        base = rng.standard_normal((T, HID), dtype=np.float32)
+        # The residual stream is f16 in memory. This is the base kernel, whose
+        # branch is still f32; the f16-branch variant is generated from it.
+        base = rng.standard_normal((T, HID), dtype=np.float32).astype(np.float16)
         branch = rng.standard_normal((T, HID), dtype=np.float32)
         lam = rng.standard_normal(HID, dtype=np.float32)
         (r,), timing = launch(hsaco, "dinov3_residual_scale_f32", (T, 1, 1), (256, 1, 1),
-                              [("i32", T), ("inout", (base, (T, HID))), ("in", branch), ("in", lam)],
+                              [("i32", T), ("inout_f16", (base, (T, HID))), ("in", branch), ("in", lam)],
                               tmp, repeat=1)
         expected = base.astype(np.float64) + branch.astype(np.float64) * lam
-        ok &= report(f"residual+ls   ({timing['per_launch_us']:7.2f} us)", r, expected)
+        ok &= report(f"residual+ls   ({timing['per_launch_us']:7.2f} us)", r, expected,
+                     atol=2e-3, rtol=2e-3)
 
     return 0 if ok else 1
 

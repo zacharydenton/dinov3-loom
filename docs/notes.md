@@ -792,3 +792,37 @@ occupancy that matters is already being reached, and spare LDS is not a
 resource that converts into throughput.** The standalone-vs-end-to-end gap is
 also worth noting -- a kernel measured alone at 1.2x contributed nothing in the
 model, because the stage it belongs to is not what the pass is waiting on.
+
+## Lever 13: the residual stream in f16 -- shipped
+
+`residual+norm` is a third of the model's memory traffic: at batch 32 it runs
+twice per layer and each launch moves 29.6 MB (read x, write x, read branch,
+write h). Two thirds of that is the f32 residual stream itself, 39.5 MB per
+layer of ~182 MB.
+
+Narrowing `x` to f16 touches four base kernels -- `residual_layernorm_f32`,
+`residual_scale_f32`, `layernorm_f32`, `embed_scatter_f32` -- and the three
+variants generated from them. Nothing else reads `x`: the matmuls consume `h`,
+the normed output, which was already f16.
+
+**Accuracy is unchanged: cosine 0.9999829 against 0.9999808 before.** The worry
+was that 24 roundings of an accumulating residual stream would compound, and it
+does not, because LayerNorm renormalises the stream every layer -- the absolute
+scale never drifts far enough for f16's ~3 decimal digits to matter.
+
+The stage is **14.7% faster** (107.6 -> 91.8 ms at batch 32, best of 3 profiled
+runs), which matches the prediction: a 33% traffic cut on a stage measured at
+54% of peak bandwidth.
+
+End to end that is ~1.6% and **not measurable on this box**. Best-of-5 at
+repeat=20 read 1.039x at batch 32 and 1.114x at batch 8, which looked like a
+win; best-of-7 at repeat=50 read 1.003x and the batch-1 path 0.995x. The first
+set was noise. Shipped anyway on the strength of the stage measurement and the
+11% cut in total memory traffic -- which is worth more than the wall clock
+suggests on an APU whose bandwidth is shared with the CPU.
+
+The measurement lesson is the same one from Lever 12, sharper: when a change is
+worth a couple of percent end to end, **profile the stage it touches** rather
+than trying to resolve it in throughput. The stage measurement was clean and
+repeatable at 14.7%; the end-to-end measurement of the same change swung between
+0.995x and 1.114x depending on the protocol.
