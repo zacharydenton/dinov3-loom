@@ -79,6 +79,10 @@ Interleaving means both sides see the same conditions -- here an idle GPU and a
 10-core CPU job resident throughout, which depresses both by a similar amount.
 Torch's `max-autotune` figure has reproduced to within 0.5% across three runs on
 three different days, so the comparison is stable even if the absolutes drift.
+The Loom rows time repeated device forwards after initialization and input
+upload. They are kernel-throughput numbers, not cold-start or Python wall-clock
+throughput; Python calls additionally include patchification and host/device
+copies, while model construction pays the one-time resident setup.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
@@ -103,8 +107,8 @@ Read it honestly:
   kernel.
 - **Batch 1 is 1.08x over `max-autotune` at batch 1.** That took split-K on the
   down projection; before it the runner launched 24 workgroups against ~120
-  slots and lost. Batch 1 is still throughput-limited by the subprocess-per-call
-  design of the Python API, not by the kernels.
+  slots and lost. The Python API now holds a native session open, so it does not
+  pay HIP initialization, module loading and weight upload on every call.
 - **Batch 64 is slower than batch 32** on this repo and it is not the cache: the
   gate/up intermediate spills the 32 MB L3 from batch 28 up, and a sweep showed
   no cliff there. It has not been chased.
@@ -148,9 +152,9 @@ folded into epilogues, one-row-per-wave LayerNorm) img/s; `docs/notes.md` has wh
 
 ```
 kernels/    .loom sources for the eleven kernels the model launches
-host/       loomrun.cpp — launches one compiled kernel and dumps its buffers
-tools/      Python drivers: compile, run, compare against NumPy f64
-scripts/    env.sh (toolchain + runtime paths), test.sh
+host/       dinov3.cpp/.h — shared inference engine and C ABI; loomrun.cpp — one kernel
+tools/      Python drivers and tests, including the independent NumPy f64 reference
+scripts/    toolchain environment, kernel/host builds, and the complete test entry point
 docs/       notes.md — the compiler and ABI landmines found so far
 ```
 
@@ -163,11 +167,11 @@ are in `requirements.txt`; the model is fetched from the Hub on first use, or se
 
 ```console
 $ pip install -r requirements.txt
+$ pip install -e .
 $ source scripts/env.sh
 $ python3 tools/export_weights.py          # 115 MB blob + manifest
 $ ./scripts/build_kernels.sh               # eleven HSACOs
-$ /opt/rocm/bin/hipcc -O2 -o host/dinov3 host/dinov3.cpp
-$ /opt/rocm/bin/hipcc -O2 -o host/loomrun host/loomrun.cpp
+$ ./scripts/build_host.sh                  # CLI tools + build/libdinov3.so
 
 $ ./scripts/test.sh                        # kernels, error paths, end-to-end
 $ ./host/dinov3 --input build/patchified.bin --batch 32 --repeat 40
@@ -175,11 +179,11 @@ $ ./host/dinov3 --input build/patchified.bin --batch 32 --repeat 40
 $ python3 tools/benchmark.py               # vs torch, interleaved
 ```
 
-`scripts/test.sh` is the one test command: it builds the kernels, checks the
-generated kernel still matches its generator, runs every unit test, exercises
-the runners' error paths, and finishes with the end-to-end comparison against
-transformers. `--quick` skips the last step, which is the only one needing
-torch.
+`scripts/test.sh` is the one test command: it builds the kernels, CLI tools and
+shared library; checks the generated kernel still matches its generator; runs
+every kernel unit test; exercises the C ABI, resident Python lifecycle and CLI
+error paths; and finishes with the end-to-end comparison against transformers.
+`--quick` skips the last comparison, which is the only part needing torch.
 
 Per-kernel tests go through `host/loomrun`, which launches one compiled HSACO
 and dumps its buffers — `tools/test_layernorm.py`, `tools/test_matmul_wmma.py`,
@@ -194,9 +198,10 @@ On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts under HRX and
 ## Replacing a PyTorch DINOv3
 
 `dinov3_loom.py` takes the same `pixel_values` an HF image processor produces
-and returns the same array as `last_hidden_state`. It is a single module at the
-repository root: `pip install -e .` makes it importable from anywhere, or run
-from the root and it is on the path already. The swap is two lines:
+and returns the same array as `last_hidden_state`. It loads `build/libdinov3.so`
+only when a model is constructed, then keeps that native session resident for
+every call. `pip install -e .` makes the module importable from anywhere. The
+swap is two lines:
 
 ```python
 # before
@@ -206,8 +211,8 @@ with torch.no_grad():
     tokens = model(pixel_values=pixel_values.cuda()).last_hidden_state.cpu().numpy()
 
 # after
-from dinov3_loom import DINOv3Loom
-model = DINOv3Loom()
+import dinov3_loom
+model = dinov3_loom.DINOv3Loom()
 tokens = model(pixel_values)          # numpy in, numpy out; no torch needed
 ```
 
@@ -231,8 +236,8 @@ def preprocess(paths):
         out.append((pixels - MEAN) / STD)
     return np.stack(out)
 
-model = DINOv3Loom()
-tokens = model(preprocess(["a.jpg", "b.jpg"]))   # (2, 201, 384)
+with DINOv3Loom() as model:
+    tokens = model(preprocess(["a.jpg", "b.jpg"])) # (2, 201, 384)
 
 cls = tokens[:, 0]                               # (2, 384) image embedding
 patches = tokens[:, 5:].reshape(-1, 14, 14, 384) # (2, 14, 14, 384) dense features
@@ -251,11 +256,19 @@ people usually take off DINOv3.
   201 tokens, 384 hidden, 6 heads. A different resolution or variant needs
   different `--config` values in `scripts/build_kernels.sh`, and the RoPE and
   attention kernels assume head_dim 64.
-- **Batches above 64 are split automatically**, because the kernels bound their
-  image index at a compiled `max_images` of 64.
-- **Each call is a subprocess**, costing a few milliseconds plus two file
-  copies. That is fine amortised over a batch and wasteful for single images in
-  a tight loop; batch 32 is where the throughput number comes from.
+- **The default resident capacity is 32 images.** Larger inputs are split
+  automatically. Set `max_batch=64` to use the kernels' compiled maximum; 32 is
+  the default because it is faster here and uses less resident GPU memory.
+- **Construction is the expensive operation.** It initializes HIP, uploads the
+  weights and loads eleven modules once. Calls after that are direct C ABI calls
+  with one upload and one download. Call `close()` or use the context manager to
+  release the session deterministically.
+- **Calls on one model are serialized.** Multiple Python threads may share it,
+  and multiple model objects own independent native sessions. Create models
+  after forking; inherited HIP sessions are rejected.
+- **Paths are configurable.** `weights=`, `kernels=` and `library=` override the
+  defaults; the equivalent environment variables are `DINOV3_LOOM_WEIGHTS`,
+  `DINOV3_LOOM_KERNELS` and `DINOV3_LOOM_LIBRARY`.
 - **gfx1151 only.** The HSACOs are compiled for that target; `LOOM_TARGET`
   changes it, but nothing else here has been measured on another chip.
 

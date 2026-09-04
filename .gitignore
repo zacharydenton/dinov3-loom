@@ -4,3 +4,4 @@ host/loomrun
 experiments/rocwmma_gemm
 __pycache__/
 *.pyc
+*.egg-info/

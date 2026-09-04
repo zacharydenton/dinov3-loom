@@ -41,7 +41,10 @@ def main() -> int:
     hf = AutoModel.from_pretrained(str(R.snapshot())).eval()
     with torch.no_grad():
         want = hf(pixel_values=torch.from_numpy(batch)).last_hidden_state.numpy()
-    got = DINOv3Loom()(batch)
+    with DINOv3Loom() as loom:
+        # Exercise the drop-in path from a torch tensor as well as coexistence
+        # between torch's ROCm libraries and the resident C ABI.
+        got = loom(torch.from_numpy(batch))
 
     if got.shape != want.shape:
         print(f"  FAIL shape {got.shape} != {want.shape}")

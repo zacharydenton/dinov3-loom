@@ -38,10 +38,8 @@ step "generated kernels match their generator" bash -c '
   python3 tools/gen_f16_variants.py --output "$tmpdir/cf16.loom" >/dev/null
   cmp -s "$tmpdir/cf16.loom" kernels/attention_online_f16_wmma_cf16.loom'
 
-# Always rebuilt: a stale binary would test the previous source.
-step "build host programs" bash -c '
-  /opt/rocm/bin/hipcc -O2 -Wall -Werror -o host/loomrun host/loomrun.cpp &&
-  /opt/rocm/bin/hipcc -O2 -Wall -Werror -o host/dinov3 host/dinov3.cpp'
+# Always rebuilt: stale binaries or libraries would test the previous source.
+step "build host programs and shared library" ./scripts/build_host.sh
 
 step "embed scatter"      python3 tools/test_embed_scatter.py
 step "layernorm"          python3 tools/test_layernorm.py
@@ -49,6 +47,7 @@ step "gate/up + swiglu"   python3 tools/test_swiglu_matmul.py
 step "matmul (WMMA)"      python3 tools/test_matmul_wmma.py
 step "fused-epilogue matmuls" python3 tools/test_fused_matmuls.py
 step "online attention"   python3 tools/test_attention_online.py
+step "resident Python API" python3 tools/test_python_api.py
 
 # Error paths: each of these must exit non-zero with a diagnostic rather than
 # reading uninitialised memory or overflowing a buffer.
@@ -69,6 +68,8 @@ step "runner rejects bad input" bash -c '
   rejects "needs a value"     ./host/dinov3 --batch                                          &&
   rejects "must be 1"         ./host/dinov3 --input build/patchified.bin --batch 0           &&
   rejects "must be 1"         ./host/dinov3 --input build/patchified.bin --batch 999         &&
+  rejects "must be an integer" ./host/dinov3 --input build/patchified.bin --batch nope       &&
+  rejects "at least 1"        ./host/dinov3 --input build/patchified.bin --repeat 0          &&
   rejects "input is required" ./host/dinov3                                                  &&
   rejects "not a multiple"    ./host/dinov3 --input "$tmpdir/short.bin"                      &&
   rejects "holds 2 images"    ./host/dinov3 --input "$tmpdir/two.bin" --batch 3              &&

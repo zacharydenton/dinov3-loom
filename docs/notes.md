@@ -1023,3 +1023,29 @@ generated cf16 attention kernel had no direct test. They do now -- and the
 embed_scatter test allocates the prefix tensor at exactly 5 rows, so the
 original over-read would fault instead of being silently discarded, which is
 precisely what end-to-end validation could not detect.
+
+## Resident Python API
+
+The original importable API launched a fresh process for every call. That kept
+ROCm isolated, but it also reinitialized HIP, uploaded both weight blobs and
+loaded eleven modules every time. The experimental shared-library binding
+removed that overhead but exposed one process-global session, leaked every GPU
+allocation and module, and let `exit()` in manifest or HIP error paths terminate
+the importing Python process.
+
+The supported API now uses an opaque `dinov3_session *`. Every session owns its
+manifests, launch dimensions, modules and device buffers; destruction unloads
+and frees all of them. The C boundary catches every exception, returns a status
+and copies the diagnostic into a caller-owned error buffer. `dinov3_run` also
+takes input and output element counts, so a bad binding cannot hand a short
+allocation to a bare-pointer kernel. The ABI has an explicit version, and the
+Python object supplies locking, deterministic `close()`/context-manager cleanup
+and rejection of sessions inherited across `fork()`.
+
+Making changing batch sizes resident uncovered one more padding dependency.
+After a batch-2 call, a batch-1 call differed from a fresh batch-1 session at
+cosine 0.9999996: the final 16-query QKV tile could observe packed-f16 padding
+left by the larger launch. Clearing only that 16-row tail before each upload
+restores bit-identical output for the same launch shape without clearing the
+large activation buffers. `tools/test_python_api.py` now changes batch sizes in
+one session specifically to keep this from regressing.
