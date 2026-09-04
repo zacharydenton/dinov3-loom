@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
     // inside this machine's run-to-run variance, so the default keeps the
     // simpler single-tile path and the flag is here to re-measure on an idle box.
     int repeat = 1, batch = 1, wide_threshold = 1 << 30;
+    bool wmma = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -136,11 +137,14 @@ int main(int argc, char **argv) {
         else if (a == "--batch") batch = std::stoi(next());
         else if (a == "--wide-threshold") wide_threshold = std::stoi(next());
         else if (a == "--profile") g_profile = true;
+        else if (a == "--f32") wmma = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
     auto spans = read_manifest(weights_dir + "/manifest.txt");
     auto blob = read_file(weights_dir + "/weights.bin");
+    auto spans16 = read_manifest(weights_dir + "/manifest_f16.txt");
+    auto blob16 = read_file(weights_dir + "/weights_f16.bin");
 
     HIP_CHECK(hipInit(0));
     float *weights = nullptr;
@@ -151,10 +155,23 @@ int main(int argc, char **argv) {
         if (it == spans.end()) { fprintf(stderr, "missing weight %s\n", name.c_str()); exit(1); }
         return weights + it->second.offset;
     };
+    unsigned short *weights16 = nullptr;
+    HIP_CHECK(hipMalloc(&weights16, blob16.size()));
+    HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)weights16, blob16.data(), blob16.size()));
+    auto W16 = [&](const std::string &name) -> unsigned short * {
+        auto it = spans16.find(name);
+        if (it == spans16.end()) { fprintf(stderr, "missing f16 weight %s\n", name.c_str()); exit(1); }
+        return weights16 + it->second.offset;
+    };
+    // Projection weights come from the f16 blob under WMMA, the f32 one otherwise.
+    auto PW = [&](const std::string &name) -> const void * {
+        return wmma ? (const void *)W16(name) : (const void *)W(name);
+    };
 
     Kernel layernorm, rope, attention, swiglu, residual;
     Kernel matmul_patch, matmul_qkvo, matmul_qkv, matmul_gateup, matmul_down, scatter;
     Kernel matmul_qkvo_wide, matmul_down_wide;
+    Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -168,6 +185,11 @@ int main(int argc, char **argv) {
     matmul_down.load(kernels_dir, "matmul_narrow_k1536_n384", "dinov3_matmul_bias_f32_narrow");
     matmul_qkvo_wide.load(kernels_dir, "matmul_k384_n384", "dinov3_matmul_bias_f32");
     matmul_down_wide.load(kernels_dir, "matmul_k1536_n384", "dinov3_matmul_bias_f32");
+    wmma_patch.load(kernels_dir, "wmma_k768_n384", "dinov3_matmul_bias_f16_wmma");
+    wmma_qkv.load(kernels_dir, "wmma_k384_n1152", "dinov3_matmul_bias_f16_wmma");
+    wmma_o.load(kernels_dir, "wmma_k384_n384", "dinov3_matmul_bias_f16_wmma");
+    wmma_gateup.load(kernels_dir, "wmma_k384_n3072", "dinov3_matmul_bias_f16_wmma");
+    wmma_down.load(kernels_dir, "wmma_k1536_n384", "dinov3_matmul_bias_f16_wmma");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -198,7 +220,7 @@ int main(int argc, char **argv) {
                                     pixels.data(), size_t(PATCHES) * PATCH_K * sizeof(float)));
     }
 
-    auto matmul = [&](Kernel &kernel, int m, int n, const float *a, const float *w,
+    auto matmul = [&](Kernel &kernel, int m, int n, const float *a, const void *w,
                       const float *bias, float *c, int tile_n = TILE) {
         KernArgs args;
         args.scalar_i32(m);
@@ -216,7 +238,8 @@ int main(int argc, char **argv) {
         // Patch embedding writes straight into the residual stream behind the
         // CLS and register tokens, so no copy is needed afterwards.
         { Stage stage("patch-embed matmul");
-          matmul(matmul_patch, patch_rows, HIDDEN, image, W("patch_w"), W("patch_b"), patched); }
+          matmul(wmma ? wmma_patch : matmul_patch, patch_rows, HIDDEN, image,
+                 PW("patch_w"), W("patch_b"), patched); }
         { Stage stage("embed scatter");
           KernArgs args;
           args.scalar_i32(rows);
@@ -227,7 +250,8 @@ int main(int argc, char **argv) {
             std::string p = "l" + std::to_string(layer) + "_";
             { Stage stage("layernorm"); norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h); }
             { Stage stage("qkv matmul");
-              matmul(matmul_qkv, rows, QKV, h, W(p + "qkv_w"), W(p + "qkv_b"), q); }
+              matmul(wmma ? wmma_qkv : matmul_qkv, rows, QKV, h,
+                     PW(p + "qkv_w"), W(p + "qkv_b"), q); }
 
             { Stage stage("rope");
             for (float *target : {q, k}) {
@@ -244,7 +268,8 @@ int main(int argc, char **argv) {
                 launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
             }
             { Stage stage("o matmul");
-              matmul(proj_kernel, rows, HIDDEN, attn, W(p + "o_w"), W(p + "o_b"), proj, narrow_tile); }
+              matmul(wmma ? wmma_o : proj_kernel, rows, HIDDEN, attn,
+                     PW(p + "o_w"), W(p + "o_b"), proj, wmma ? TILE : narrow_tile); }
             { Stage stage("residual+ls");
                 KernArgs args;
                 args.scalar_i32(rows);
@@ -254,7 +279,8 @@ int main(int argc, char **argv) {
 
             { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h); }
             { Stage stage("gate/up matmul");
-              matmul(matmul_gateup, rows, GATEUP, h, W(p + "gateup_w"), W(p + "gateup_b"), gate); }
+              matmul(wmma ? wmma_gateup : matmul_gateup, rows, GATEUP, h,
+                     PW(p + "gateup_w"), W(p + "gateup_b"), gate); }
             { Stage stage("swiglu");
                 KernArgs args;
                 args.scalar_i32(rows);
@@ -262,7 +288,8 @@ int main(int argc, char **argv) {
                 launch(swiglu.function, rows, 1, args);
             }
             { Stage stage("down matmul");
-              matmul(down_kernel, rows, HIDDEN, act, W(p + "down_w"), W(p + "down_b"), mlp, narrow_tile); }
+              matmul(wmma ? wmma_down : down_kernel, rows, HIDDEN, act,
+                     PW(p + "down_w"), W(p + "down_b"), mlp, wmma ? TILE : narrow_tile); }
             { Stage stage("residual+ls");
                 KernArgs args;
                 args.scalar_i32(rows);

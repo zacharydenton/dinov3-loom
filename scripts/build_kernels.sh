@@ -44,3 +44,10 @@ for kn in 384:384 1536:384; do
   compile matmul_bias_f32_narrow dinov3_matmul_bias_f32_narrow "matmul_narrow_k${k}_n${n}" \
     "dinov3.matmul_bias_f32_narrow.k_size=$k" "dinov3.matmul_bias_f32_narrow.n_size=$n"
 done
+# WMMA variants: f16 weights, f32 activations narrowed on the way into LDS,
+# f32 accumulation.
+for kn in 768:384 384:384 384:1152 384:3072 1536:384; do
+  k="${kn%%:*}"; n="${kn##*:}"
+  compile matmul_bias_f16_wmma dinov3_matmul_bias_f16_wmma "wmma_k${k}_n${n}" \
+    "dinov3.matmul_bias_f16_wmma.k_size=$k" "dinov3.matmul_bias_f16_wmma.n_size=$n"
+done
