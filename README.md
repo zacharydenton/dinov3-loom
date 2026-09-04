@@ -68,45 +68,57 @@ means both sides saw the same contention.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 1293.3 | 2.76x |
-| torch compile fp16, batch 64 | 1028.1 | 2.20x |
-| torch eager fp16, batch 64 | 836.2 | 1.79x |
-| torch max-autotune fp16, batch 1 | 556.8 | 1.19x |
-| **loom wmma fp16, batch 32** | **467.9** | **1.00x** |
-| **loom wmma fp16, batch 64** | **445.8** | 0.95x |
-| torch compile fp16, batch 1 | 310.0 | 0.66x |
-| **loom wmma fp16, batch 1** | **271.0** | 0.58x |
-| torch eager fp16, batch 1 | 268.6 | 0.57x |
-| torch max-autotune fp32, batch 64 | 237.4 | 0.51x |
-| **loom fp32, batch 32** | **214.6** | 0.46x |
-| torch compile fp32, batch 64 | 168.5 | 0.36x |
-| torch eager fp32, batch 64 | 146.2 | 0.31x |
-| **loom fp32, batch 1** | **117.3** | 0.25x |
-| torch eager fp32, batch 1 | 115.1 | 0.25x |
+| torch max-autotune fp16, batch 64 | 1276.2 | 1.91x |
+| torch compile fp16, batch 64 | 1130.7 | 1.69x |
+| torch eager fp16, batch 64 | 846.2 | 1.27x |
+| **loom wmma+flash fp16, batch 8** | **667.3** | **1.00x** |
+| **loom wmma+flash fp16, batch 64** | **601.3** | 0.90x |
+| torch max-autotune fp16, batch 1 | 600.5 | 0.90x |
+| **loom wmma+flash fp16, batch 32** | **477.8** | 0.72x |
+| **loom wmma+flash fp16, batch 1** | **421.4** | 0.63x |
+| torch compile fp16, batch 1 | 388.6 | 0.58x |
+| torch eager fp16, batch 1 | 295.4 | 0.44x |
+| torch max-autotune fp32, batch 64 | 232.2 | 0.35x |
+| **loom fp32, batch 32** | **207.1** | 0.31x |
+| torch compile fp32, batch 64 | 183.2 | 0.27x |
+| torch eager fp32, batch 64 | 158.8 | 0.24x |
+| **loom fp32, batch 1** | **123.2** | 0.18x |
+| torch eager fp32, batch 1 | 115.5 | 0.17x |
 
 Read it honestly:
 
-- **At fp32 these kernels beat everything torch has**, by 1.3x over its best
-  (max-autotune batch 64) and 1.5x over `torch.compile`.
-- **At fp16 the WMMA path doubles that to 467.9 img/s** and clears every torch
-  fp16 batch-1 configuration except `max-autotune`. It does not yet reach torch's
-  batched fp16, which is 1.8-2.8x further ahead.
-- **That remaining gap is attention, not the matmuls.** With WMMA in place the
-  matmuls are down to 35% of the time and attention -- still scalar f32 -- is
-  36.7%, with the elementwise kernels (swiglu, layernorm, residual, rope) making
-  up the rest. A WMMA flash attention is the next kernel; ggml-hrx's corpus has
-  one to work from.
-- **`torch.compile` remains a pessimisation at fp32 batch 1** (125.7 and 123.3 vs
-  eager's 115.1 is inside the noise), and **max-autotune does not fail on ViT-S+**
-  the way it does on ViT-L -- the 96 KB LDS request that breaks it there does not
-  arise at head_dim 64 with 201 tokens.
+- **Every torch batch-1 configuration is beaten, at both precisions.** At fp16
+  the Loom path at batch 1 (421.4) clears `torch.compile` (388.6) and eager
+  (295.4); its best (667.3) also clears `max-autotune` at batch 1 (600.5). At
+  fp32 it beats torch's best of any batch.
+- **Torch's batched fp16 is still ahead**, by 1.27x for eager and 1.91x for
+  max-autotune at batch 64. That is the remaining gap.
+- **Batch 32 measuring below batch 8 and 64 is noise, not a curve.** Individual
+  samples for one configuration have ranged 115 to 243 img/s on this machine
+  during other work. Treat anything inside ~20% as a tie.
 
-Accuracy under WMMA is cosine **0.999999** against transformers (f16 weights,
-f32 accumulation); the f32 path is exact to ten digits. xdna-vision gates DINOv3
-at 0.997.
+Accuracy: cosine **0.99998** against transformers with WMMA and flash attention
+(f16 weights, f16 probabilities, f32 accumulation). The WMMA matmul alone, with
+the scalar attention, is 0.999999; the pure f32 path is exact to ten digits.
+xdna-vision gates DINOv3 at 0.997. `--f32` and `--no-flash` select the slower,
+more accurate paths.
 
-The whole run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 -> 468 img/s;
-`docs/notes.md` has what each step was worth.
+Where the time goes at batch 32, with everything on:
+
+```
+attention              23.6%
+gate/up matmul         23.0%
+down matmul            15.1%
+swiglu                 14.5%   <- pure f32 bandwidth
+qkv matmul              8.1%
+residual+ls             4.4%
+o matmul                4.0%
+layernorm               3.9%
+rope                    2.5%
+```
+
+The run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 (f32) -> 468 (WMMA) -> 667
+(+ flash attention) img/s; `docs/notes.md` has what each step was worth.
 
 ## Layout
 

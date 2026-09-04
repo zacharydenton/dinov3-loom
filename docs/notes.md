@@ -183,3 +183,32 @@ rope                    3.1%
 The matmuls are no longer the problem. Attention is, and the elementwise kernels
 together are another 28% -- swiglu alone moves ~44 MB per image in f32, which an
 f16 handoff to the down projection would halve.
+
+## Flash attention
+
+201 tokens is small enough that the whole score row fits in LDS, so this is a
+two-pass softmax rather than a real FlashAttention: compute every score, take the
+row max and sum, then do P*V. No online rescaling, no running statistics carried
+across key blocks -- strictly less arithmetic than the streaming form, and much
+less code.
+
+One workgroup per (16 query rows, head), 8 wave32s. QK^T gives each wave one
+16x16 score tile per 128-key block; P*V gives four of the eight waves one 16x16
+output tile each. The two layout tricks:
+
+* QK^T's rhs wants logical `[dim][key]`; K is staged `[key][dim]`, so a
+  `encoding.layout.strided [1, 68]` view reads it transposed.
+* P*V's rhs wants logical `[key][dim]`, which is the staged order already.
+
+Row strides are padded to odd dword counts (68 f16 = 34 dwords, 212 f32) so the
+16 rows a fragment load touches spread across banks. Third kernel in this repo
+where that mattered.
+
+3.5x on the kernel, 1.35x end to end. Accuracy drops from cosine 0.999999 to
+0.99998 because the probabilities are narrowed to f16 before the P*V fragments,
+on top of the f16 weights.
+
+Attention is now 23.6% of the time and **swiglu has grown to 14.5%** -- it is pure
+f32 bandwidth, reading two [rows, 1536] tensors and writing a third. Having it
+emit f16 straight into the down projection's staging would halve that, and is
+probably the next thing worth doing.
