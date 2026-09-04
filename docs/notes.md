@@ -764,3 +764,31 @@ Note also that fp8 is *not* an option here: gfx1151 is RDNA3.5 and its WMMA has
 no fp8 form (the fp8 opcodes in the Loom tables are for later targets). fp8
 weights would also not have helped batch 1, which is workgroup-starved rather
 than bandwidth-starved -- see Lever 10.
+
+## Lever 12: attention LDS aliasing -- rejected, same law again
+
+The online attention kernel is one wave per workgroup, so LDS per workgroup sets
+occupancy directly: 4608 B (512 B score scratch + 4096 B result stage) allowed
+14 waves/CU against the 18 its 168 VGPRs permit. The two have disjoint lifetimes
+-- the scratch is dead once the key loop's last barrier retires -- so aliasing
+them into one 4096 B arena costs nothing and lifts the ceiling to 16 waves.
+Publishing the result in two 16x32 halves instead gets 2048 B and the full 18.
+
+Standalone it looked promising (4096 B: 1.04x, 1.05x, 0.96x at batch 32 across
+runs; a consistent ~1.2x at batch 8). End to end it is not there:
+
+| batch | 4608 B / 14 waves | 4096 B / 16 waves | |
+| ---: | ---: | ---: | ---: |
+| 4 | 1191.7 | 1191.8 | 1.000x |
+| 8 | 1207.2 | 1226.0 | 1.016x |
+| 16 | 1300.1 | 1349.4 | 1.038x |
+| 32 | 1363.7 | 1323.1 | 0.970x |
+
+Batch 16 and batch 32 disagree in sign, so this is inside the noise. Reverted.
+
+That is the second time raising occupancy by aliasing dead LDS has failed to pay
+(Lever 7 was the matmul), and it is the same conclusion: **on this part the
+occupancy that matters is already being reached, and spare LDS is not a
+resource that converts into throughput.** The standalone-vs-end-to-end gap is
+also worth noting -- a kernel measured alone at 1.2x contributed nothing in the
+model, because the stage it belongs to is not what the pass is waiting on.
