@@ -131,7 +131,8 @@ int main(int argc, char **argv) {
     // are generated and compile fine, so --f16-qkv keeps them reachable, but the
     // default is off. See docs/notes.md.
     bool f16_qkv = false;
-    bool fuse_norm = true;   // residual + LayerScale + LayerNorm in one kernel
+    bool fuse_norm = true;     // residual + LayerScale + LayerNorm in one kernel
+    bool fuse_swiglu = true;   // gate/up projection with SwiGLU as its epilogue
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -148,6 +149,7 @@ int main(int argc, char **argv) {
         else if (a == "--f32-act") f16_act = false;
         else if (a == "--f16-qkv") f16_qkv = true;
         else if (a == "--no-fuse-norm") fuse_norm = false;
+        else if (a == "--no-fuse-swiglu") fuse_swiglu = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -183,7 +185,7 @@ int main(int argc, char **argv) {
     Kernel matmul_qkvo_wide, matmul_down_wide;
     Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
-    Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm;
+    Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -213,6 +215,7 @@ int main(int argc, char **argv) {
     wmma_qkv16_cf16.load(kernels_dir, "wmma_af16_cf16_k384_n1152", "dinov3_matmul_bias_f16_wmma_af16_cf16");
     rope16.load(kernels_dir, "rope_f16", "dinov3_rope_2d_f32_f16");
     residual_norm.load(kernels_dir, "residual_layernorm", "dinov3_residual_layernorm_f32");
+    wmma_swiglu.load(kernels_dir, "wmma_swiglu_k384_n1536", "dinov3_matmul_swiglu_f16_wmma");
     flash16_af16.load(kernels_dir, "flash_attention_af16", "dinov3_flash_attention_f16_wmma_cf16_af16");
 
     const int rows = batch * TOKENS;          // residual-stream rows
@@ -226,6 +229,7 @@ int main(int argc, char **argv) {
     const bool narrow_qkv = narrow_act && f16_qkv;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
+    const bool fused_swiglu = narrow_act && fuse_swiglu;
     const bool wide_narrow_n = rows >= wide_threshold;
     Kernel &proj_kernel = wide_narrow_n ? matmul_qkvo_wide : matmul_qkvo;
     Kernel &down_kernel = wide_narrow_n ? matmul_down_wide : matmul_down;
@@ -348,14 +352,22 @@ int main(int argc, char **argv) {
                 }
                 { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h, narrow_act); }
             }
-            { Stage stage("gate/up matmul");
-              matmul(narrow_act ? wmma_gateup16 : (wmma ? wmma_gateup : matmul_gateup),
-                     rows, GATEUP, h, PW(p + "gateup_w"), W(p + "gateup_b"), gate); }
-            { Stage stage("swiglu");
-                KernArgs args;
-                args.scalar_i32(rows);
-                args.pointer(gate); args.pointer(up); args.pointer(act);
-                launch(narrow_act ? swiglu16.function : swiglu.function, rows, 1, args);
+            if (fused_swiglu) {
+                // One workgroup accumulates both projections for the same output
+                // columns, so the 2*INTERMEDIATE intermediate is never written.
+                Stage stage("gate/up+swiglu");
+                matmul(wmma_swiglu, rows, INTERMEDIATE, h, PW(p + "gateup_w"),
+                       W(p + "gateup_b"), act);
+            } else {
+                { Stage stage("gate/up matmul");
+                  matmul(narrow_act ? wmma_gateup16 : (wmma ? wmma_gateup : matmul_gateup),
+                         rows, GATEUP, h, PW(p + "gateup_w"), W(p + "gateup_b"), gate); }
+                { Stage stage("swiglu");
+                    KernArgs args;
+                    args.scalar_i32(rows);
+                    args.pointer(gate); args.pointer(up); args.pointer(act);
+                    launch(narrow_act ? swiglu16.function : swiglu.function, rows, 1, args);
+                }
             }
             { Stage stage("down matmul");
               matmul(narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel),

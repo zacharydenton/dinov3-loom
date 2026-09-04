@@ -318,3 +318,48 @@ per forward down to 26.
 | batch 32 | **800.3** | 764.8 |
 
 +7.1% and +4.6%, accuracy unchanged.
+
+## Lever 3: SwiGLU as a matmul epilogue -- kept
+
+Inductor folds `silu(gate) * up` into the *up* projection's epilogue, reading the
+already-computed gate result from memory. That shape does not fit here, because
+gate and up are one fused `[rows, 2*width]` matmul and the two halves are
+produced by different workgroups.
+
+The version that does fit is a **dual-N** matmul: one workgroup accumulates both
+projections for the same output columns, holding four accumulator fragments per
+wave instead of two, and applies SwiGLU in the epilogue. The
+`[rows, 2*width]` intermediate is then never written at all.
+
+Traffic, in units of `[rows, width]` f16 per layer:
+
+| | before | after |
+| --- | ---: | ---: |
+| gate/up matmul writes | 2 | 1 |
+| swiglu reads + writes | 3 | 0 |
+| down matmul reads A (6 column tiles) | 6 | 6 |
+| **total** | **11** | **7** |
+
+**Kept**, and it is the largest single win since the WMMA matmul itself. Best of
+3, alternating:
+
+| | fused | split |
+| --- | ---: | ---: |
+| batch 8 | **863.4** | 811.4 |
+| batch 32 | **917.2** | 776.6 |
+
+Accuracy improves slightly too (0.9999996 against 0.9999995): the intermediate no
+longer makes a round trip through f16.
+
+Note this cost 88 VGPRs and 31744 bytes of LDS against 64 and 18432 -- the same
+resource increase that made hand double-buffering a loss. The difference is that
+this one removes a whole pass rather than hiding latency the hardware was already
+hiding.
+
+## A trap worth recording
+
+`tools/validate.py` used to write its synthetic image to `build/patchified.bin`,
+which is also the benchmark's input. Running it silently repointed every
+subsequent hand comparison at a different picture, and the next accuracy check
+read cosine 0.548 and looked like a catastrophic regression in a kernel that was
+in fact correct. It now writes to `/tmp/validate_patchified.bin`.

@@ -46,11 +46,14 @@ def main() -> int:
     ok = True
     for seed in (0, 1, 2):
         image = make_image(seed)
-        R.patchify(image).astype(np.float32).tofile(ROOT / "build/patchified.bin")
+        # Deliberately not build/patchified.bin: that file is the benchmark's
+        # input, and clobbering it here silently invalidates every hand
+        # comparison against a saved reference afterwards.
+        R.patchify(image).astype(np.float32).tofile("/tmp/validate_patchified.bin")
         subprocess.run([str(ROOT / "host/dinov3"),
                         "--weights", str(ROOT / "build/weights"),
                         "--kernels", str(ROOT / "build/kernels"),
-                        "--input", str(ROOT / "build/patchified.bin"),
+                        "--input", "/tmp/validate_patchified.bin",
                         "--output", "/tmp/loom_validate.bin"], check=True, cwd=ROOT,
                        capture_output=True, env=gpu_env)
         loom = np.fromfile("/tmp/loom_validate.bin", dtype=np.float32).reshape(R.TOKENS, R.HIDDEN)
