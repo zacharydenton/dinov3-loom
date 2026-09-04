@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     // inside this machine's run-to-run variance, so the default keeps the
     // simpler single-tile path and the flag is here to re-measure on an idle box.
     int repeat = 1, batch = 1, wide_threshold = 1 << 30;
-    bool wmma = true, flash_attn = true;
+    bool wmma = true, flash_attn = true, f16_act = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -139,6 +139,7 @@ int main(int argc, char **argv) {
         else if (a == "--profile") g_profile = true;
         else if (a == "--f32") wmma = false;
         else if (a == "--no-flash") flash_attn = false;
+        else if (a == "--f32-act") f16_act = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -173,6 +174,7 @@ int main(int argc, char **argv) {
     Kernel matmul_patch, matmul_qkvo, matmul_qkv, matmul_gateup, matmul_down, scatter;
     Kernel matmul_qkvo_wide, matmul_down_wide;
     Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
+    Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -192,12 +194,21 @@ int main(int argc, char **argv) {
     wmma_gateup.load(kernels_dir, "wmma_k384_n3072", "dinov3_matmul_bias_f16_wmma");
     wmma_down.load(kernels_dir, "wmma_k1536_n384", "dinov3_matmul_bias_f16_wmma");
     flash.load(kernels_dir, "flash_attention", "dinov3_flash_attention_f16_wmma");
+    layernorm16.load(kernels_dir, "layernorm_f16", "dinov3_layernorm_f32_f16");
+    swiglu16.load(kernels_dir, "swiglu_f16", "dinov3_swiglu_f32_f16");
+    flash16.load(kernels_dir, "flash_attention_cf16", "dinov3_flash_attention_f16_wmma_cf16");
+    wmma_qkv16.load(kernels_dir, "wmma_af16_k384_n1152", "dinov3_matmul_bias_f16_wmma_af16");
+    wmma_o16.load(kernels_dir, "wmma_af16_k384_n384", "dinov3_matmul_bias_f16_wmma_af16");
+    wmma_down16.load(kernels_dir, "wmma_af16_k1536_n384", "dinov3_matmul_bias_f16_wmma_af16");
+    wmma_gateup16.load(kernels_dir, "wmma_af16_cf16_k384_n3072", "dinov3_matmul_bias_f16_wmma_af16_cf16");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
     // The 64x32 tile exists to get enough workgroups out of N=384 at one image.
     // Once the batch supplies the workgroups, the 64x64 tile's better
     // compute-to-LDS ratio wins again.
+    // Activations that only feed a matmul are carried as f16.
+    const bool narrow_act = wmma && f16_act;
     const bool wide_narrow_n = rows >= wide_threshold;
     Kernel &proj_kernel = wide_narrow_n ? matmul_qkvo_wide : matmul_qkvo;
     Kernel &down_kernel = wide_narrow_n ? matmul_down_wide : matmul_down;
@@ -211,7 +222,10 @@ int main(int argc, char **argv) {
     alloc(&gate, size_t(rows) * GATEUP);
     alloc(&act, size_t(rows) * INTERMEDIATE);  alloc(&out, size_t(rows) * HIDDEN);
     alloc(&patched, size_t(patch_rows) * HIDDEN);
-    k = q + HIDDEN; v = q + 2 * HIDDEN; up = gate + INTERMEDIATE;
+    k = q + HIDDEN; v = q + 2 * HIDDEN;
+    // When gate/up is f16 the two halves are INTERMEDIATE f16 apart, which is
+    // half as many float-sized steps.
+    up = (wmma && f16_act) ? gate + INTERMEDIATE / 2 : gate + INTERMEDIATE;
     alloc(&image, size_t(patch_rows) * PATCH_K);
 
     if (!input_path.empty()) {
@@ -229,11 +243,13 @@ int main(int argc, char **argv) {
         args.pointer(a); args.pointer(w); args.pointer(bias); args.pointer(c);
         launch(kernel.function, n / tile_n, (m + TILE - 1) / TILE, args);
     };
-    auto norm = [&](const float *in, const float *gamma, const float *beta, float *dst) {
+    // `dst` is f16 when narrow_act, so callers treat it as opaque.
+    auto norm = [&](const float *in, const float *gamma, const float *beta, void *dst,
+                    bool narrow) {
         KernArgs args;
         args.scalar_i32(rows);
         args.pointer(in); args.pointer(gamma); args.pointer(beta); args.pointer(dst);
-        launch(layernorm.function, rows, 1, args);
+        launch(narrow ? layernorm16.function : layernorm.function, rows, 1, args);
     };
 
     auto forward = [&]() {
@@ -250,9 +266,9 @@ int main(int argc, char **argv) {
 
         for (int layer = 0; layer < LAYERS; ++layer) {
             std::string p = "l" + std::to_string(layer) + "_";
-            { Stage stage("layernorm"); norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h); }
+            { Stage stage("layernorm"); norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h, narrow_act); }
             { Stage stage("qkv matmul");
-              matmul(wmma ? wmma_qkv : matmul_qkv, rows, QKV, h,
+              matmul(narrow_act ? wmma_qkv16 : (wmma ? wmma_qkv : matmul_qkv), rows, QKV, h,
                      PW(p + "qkv_w"), W(p + "qkv_b"), q); }
 
             { Stage stage("rope");
@@ -267,16 +283,18 @@ int main(int argc, char **argv) {
                 args.scalar_i32(rows);
                 args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
                 if (wmma && flash_attn) {
+                    Kernel &fa = narrow_act ? flash16 : flash;
                     // One workgroup per (16 query rows within an image, head).
-                    launch(flash.function, batch * ((TOKENS + 15) / 16), HEADS, args);
+                    launch(fa.function, batch * ((TOKENS + 15) / 16), HEADS, args);
                 } else {
                     // One workgroup per (block of 8 queries within an image, head).
                     launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
                 }
             }
             { Stage stage("o matmul");
-              matmul(wmma ? wmma_o : proj_kernel, rows, HIDDEN, attn,
-                     PW(p + "o_w"), W(p + "o_b"), proj, wmma ? TILE : narrow_tile); }
+              matmul((narrow_act && flash_attn) ? wmma_o16 : (wmma ? wmma_o : proj_kernel),
+                     rows, HIDDEN, attn, PW(p + "o_w"), W(p + "o_b"), proj,
+                     wmma ? TILE : narrow_tile); }
             { Stage stage("residual+ls");
                 KernArgs args;
                 args.scalar_i32(rows);
@@ -284,19 +302,20 @@ int main(int argc, char **argv) {
                 launch(residual.function, rows, 1, args);
             }
 
-            { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h); }
+            { Stage stage("layernorm"); norm(x, W(p + "norm2_w"), W(p + "norm2_b"), h, narrow_act); }
             { Stage stage("gate/up matmul");
-              matmul(wmma ? wmma_gateup : matmul_gateup, rows, GATEUP, h,
-                     PW(p + "gateup_w"), W(p + "gateup_b"), gate); }
+              matmul(narrow_act ? wmma_gateup16 : (wmma ? wmma_gateup : matmul_gateup),
+                     rows, GATEUP, h, PW(p + "gateup_w"), W(p + "gateup_b"), gate); }
             { Stage stage("swiglu");
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(gate); args.pointer(up); args.pointer(act);
-                launch(swiglu.function, rows, 1, args);
+                launch(narrow_act ? swiglu16.function : swiglu.function, rows, 1, args);
             }
             { Stage stage("down matmul");
-              matmul(wmma ? wmma_down : down_kernel, rows, HIDDEN, act,
-                     PW(p + "down_w"), W(p + "down_b"), mlp, wmma ? TILE : narrow_tile); }
+              matmul(narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel),
+                     rows, HIDDEN, act, PW(p + "down_w"), W(p + "down_b"), mlp,
+                     wmma ? TILE : narrow_tile); }
             { Stage stage("residual+ls");
                 KernArgs args;
                 args.scalar_i32(rows);
@@ -304,7 +323,7 @@ int main(int argc, char **argv) {
                 launch(residual.function, rows, 1, args);
             }
         }
-        { Stage stage("layernorm"); norm(x, W("norm_w"), W("norm_b"), out); }
+        { Stage stage("layernorm"); norm(x, W("norm_w"), W("norm_b"), out, false); }
     };
 
     forward();

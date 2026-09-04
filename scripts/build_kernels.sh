@@ -28,6 +28,15 @@ compile attention_f32 dinov3_attention_f32 attention \
 compile embed_scatter_f32 dinov3_embed_scatter_f32 embed_scatter \
   dinov3.embed_scatter_f32.hidden_size=384 dinov3.embed_scatter_f32.tokens_per_image=201 \
   dinov3.embed_scatter_f32.prefix=5
+compile layernorm_f32_to_f16 dinov3_layernorm_f32_f16 layernorm_f16 \
+  dinov3.layernorm_f32_f16.hidden_size=384 dinov3.layernorm_f32_f16.epsilon=1e-5
+compile swiglu_f16 dinov3_swiglu_f32_f16 swiglu_f16 \
+  dinov3.swiglu_f32_f16.width=1536 dinov3.swiglu_f32_f16.row_stride=3072
+compile flash_attention_f16_wmma_cf16 dinov3_flash_attention_f16_wmma_cf16 flash_attention_cf16 \
+  dinov3.flash_attention_f16_wmma_cf16.hidden_size=384 \
+  dinov3.flash_attention_f16_wmma_cf16.qkv_stride=1152 \
+  dinov3.flash_attention_f16_wmma_cf16.tokens_per_image=201 \
+  dinov3.flash_attention_f16_wmma_cf16.scale=0.125
 compile flash_attention_f16_wmma dinov3_flash_attention_f16_wmma flash_attention \
   dinov3.flash_attention_f16_wmma.hidden_size=384 \
   dinov3.flash_attention_f16_wmma.qkv_stride=1152 \
@@ -56,3 +65,12 @@ for kn in 768:384 384:384 384:1152 384:3072 1536:384; do
   compile matmul_bias_f16_wmma dinov3_matmul_bias_f16_wmma "wmma_k${k}_n${n}" \
     "dinov3.matmul_bias_f16_wmma.k_size=$k" "dinov3.matmul_bias_f16_wmma.n_size=$n"
 done
+# f16-activation variants: A already f16 for the projections fed by an
+# f16-producing kernel, and f16 out where the only consumer is another matmul.
+for kn in 384:1152 384:384 1536:384; do
+  k="${kn%%:*}"; n="${kn##*:}"
+  compile matmul_bias_f16_wmma_af16 dinov3_matmul_bias_f16_wmma_af16 "wmma_af16_k${k}_n${n}" \
+    "dinov3.matmul_bias_f16_wmma_af16.k_size=$k" "dinov3.matmul_bias_f16_wmma_af16.n_size=$n"
+done
+compile matmul_bias_f16_wmma_af16_cf16 dinov3_matmul_bias_f16_wmma_af16_cf16 wmma_af16_cf16_k384_n3072 \
+  dinov3.matmul_bias_f16_wmma_af16_cf16.k_size=384 dinov3.matmul_bias_f16_wmma_af16_cf16.n_size=3072
