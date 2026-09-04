@@ -876,3 +876,49 @@ against the in-model 1.41x. The standalone compared one fused launch against a
 matmul plus two rope launches timed separately at repeat=50, which amortises
 launch overhead differently from the real sequence. Where the two disagree, the
 in-model number is the one that counts.
+
+## Lever 15: what actually limits attention -- diagnosed, not fixed
+
+Attention is 12.0% of the pass at ~8 TFLOP/s, 15% of peak, and the worst
+efficiency left in the model. Three probes, each a deliberately-wrong variant
+timed against the real kernel, to find out what it is waiting on.
+
+**Barriers: no.** The kernel is one wave per workgroup and pays two
+workgroup-scope barriers per key tile for an LDS round trip that is entirely
+intra-wave. Narrowing them to subgroup scope made it *slower* -- 0.837x at batch
+1, 0.951x at 8, 0.996x at 32 -- so the workgroup barrier was already being
+elided for a single-wave workgroup, and the subgroup form generates worse code.
+
+**The online-softmax chain: only at small batch.** Deleting the two cross-lane
+reductions per key tile (`kernel.workgroup.reduce` for the running max and sum)
+is worth **1.278x at batch 1 and 1.495x at batch 8, but 1.016x at batch 32.**
+Where the machine is full there is enough independent work to hide the serial
+chain completely, and the bookkeeping is free. This kills the obvious
+restructuring -- fewer, fatter softmax steps -- for the batch sizes that matter.
+
+**K/V fetch: yes, at batch 32.** Pinning every iteration to the same key tile,
+so K and V come from cache, is worth **1.249x at batch 32** (and only 1.071x at
+batch 1, 1.048x at batch 8). Each image's 13 query tiles independently re-read
+the whole of K and V, which at batch 32 is ~128 MB per layer against the ~20 MB
+the data actually occupies. It is served from L2/L3 rather than DRAM, but the
+bandwidth is real and it is a quarter of the stage.
+
+### Why this is not being fixed
+
+The fix for redundant K/V reads is more query rows per wave: 32 instead of 16
+halves the traffic. But the accumulators and the softmax state double -- eight
+`vector<8xf32>` accumulators and eight more for the running max/sum, against
+four and four -- taking the kernel from 168 VGPRs to roughly 240. At 240,
+gfx1151 fits 6 waves per SIMD against the current 7, so occupancy falls from 14
+waves/CU to 12 exactly when the extra latency needs hiding.
+
+The ceiling is 1.249x on the stage even if K/V fetch were free, so halving it is
+worth at most ~1.12x on 12% of the pass: **about 1.4% end to end, before the
+occupancy loss.** That is below what this box can measure and below the noise
+floor that has already produced two false positives this session. Combined with
+six failed restructurings elsewhere, the expected value is negative and the work
+is not being done.
+
+The diagnostics are the useful output: attention is **K/V-bandwidth-bound at
+large batch and softmax-latency-bound at small batch**, which are different
+problems wanting different kernels, and neither is barrier-bound.

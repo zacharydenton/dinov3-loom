@@ -213,7 +213,7 @@ kernel.def target(@dinov3_attention_online_gfx11) export("dinov3_attention_onlin
     // 512 bytes of LDS, purely to reinterpret an f32 result fragment as an f16
     // lhs fragment. This is the only synchronisation in the kernel.
     vector.fragment.store<result> %weight, %scratch_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x16xf16>
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
     %probability = vector.fragment.load<lhs> %scratch_view[%c0, %c0] shape [%m, %k_frag] : view<16x16xf16> -> vector<16xf16>
 
     %channel0 = index.add %head_base0, %c0 : index
@@ -232,7 +232,7 @@ kernel.def target(@dinov3_attention_online_gfx11) export("dinov3_attention_onlin
     %next1 = vector.mma %probability, %v1, %rescaled1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next2 = vector.mma %probability, %v2, %rescaled2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next3 = vector.mma %probability, %v3, %rescaled3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
     scf.yield %next_max_even, %next_sum_even, %next_max_odd, %next_sum_odd, %next0, %next1, %next2, %next3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
   }
 
@@ -249,7 +249,7 @@ kernel.def target(@dinov3_attention_online_gfx11) export("dinov3_attention_onlin
   vector.fragment.store<result> %out1, %result_view[%c0, %c16] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
   vector.fragment.store<result> %out2, %result_view[%c0, %c32] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
   vector.fragment.store<result> %out3, %result_view[%c0, %c48] shape [%m, %n] : vector<8xf32>, view<16x64xf32>
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
 
   // 16 rows x 64 channels is 256 vector4s over 32 lanes: eight each, with the
   // rows that ran past this image's tokens dropped.
