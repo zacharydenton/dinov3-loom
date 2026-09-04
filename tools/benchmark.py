@@ -71,7 +71,7 @@ def main() -> None:
     best: dict[str, float] = {}
     for round_index in range(ROUNDS):
         for loom_batch in (1, 8, 32, 64):
-            key = f"loom wmma+flash fp16 (batch {loom_batch})"
+            key = f"loom fp16 (batch {loom_batch})"
             best[key] = max(best.get(key, 0.0), loom_throughput(loom_batch, wmma=True))
         for loom_batch in (1, 32):
             key = f"loom fp32 (batch {loom_batch})"

@@ -212,3 +212,25 @@ Attention is now 23.6% of the time and **swiglu has grown to 14.5%** -- it is pu
 f32 bandwidth, reading two [rows, 1536] tensors and writing a third. Having it
 emit f16 straight into the down projection's staging would halve that, and is
 probably the next thing worth doing.
+
+## f16 activations, and why the read side dominates
+
+swiglu had grown to 14.5% of the time, which looked like a write-bandwidth
+problem: two `[rows, 1536]` f32 reads and one f32 write. Producing it as f16
+halves that, and the same argument applies to layernorm and the attention output
+-- all three feed nothing but a matmul, which narrows them to f16 on the way into
+LDS regardless.
+
+The bigger half of the win is on the read side, and it is not obvious from the
+profile. A matmul workgroup stages a 64-row slab of A per k-step, so A is read
+once per *column tile*: gate/up has 3072/64 = **48** of them, qkv has 18, down
+has 6. Halving the dtype halves all of that.
+
+Measured 1.17x at batch 8 and 1.25x at batch 32, with swiglu falling from 14.5%
+to 4.1% of the time and accuracy unmoved at cosine 0.99998.
+
+Both dtype paths are generated rather than copied -- `tools/gen_matmul_wmma.py`
+emits the (A f16) and (C f16) matmul variants from the base kernel, and
+`tools/gen_f16_variants.py` does the same for layernorm, swiglu and flash
+attention -- so they cannot drift apart. The residual stream, the norm statistics
+and the final output stay f32.

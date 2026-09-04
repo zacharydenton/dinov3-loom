@@ -1,19 +1,19 @@
 configuration                          img/s   vs best Loom
-torch max-autotune fp16 (batch 64)    1276.2    1.91x
-torch compile fp16 (batch 64)         1130.7    1.69x
-torch eager fp16 (batch 64)            846.2    1.27x
-loom wmma+flash fp16 (batch 8)         667.3    1.00x  <-- this repo
-loom wmma+flash fp16 (batch 64)        601.3    0.90x  <-- this repo
-torch max-autotune fp16 (batch 1)      600.5    0.90x
-loom wmma+flash fp16 (batch 32)        477.8    0.72x  <-- this repo
-loom wmma+flash fp16 (batch 1)         421.4    0.63x  <-- this repo
-torch compile fp16 (batch 1)           388.6    0.58x
-torch eager fp16 (batch 1)             295.4    0.44x
-torch max-autotune fp32 (batch 64)     232.2    0.35x
-loom fp32 (batch 32)                   207.1    0.31x  <-- this repo
-torch compile fp32 (batch 64)          183.2    0.27x
-torch eager fp32 (batch 64)            158.8    0.24x
-torch compile fp32 (batch 1)           126.4    0.19x
-torch max-autotune fp32 (batch 1)      125.1    0.19x
-loom fp32 (batch 1)                    123.2    0.18x  <-- this repo
-torch eager fp32 (batch 1)             115.5    0.17x
+torch max-autotune fp16 (batch 64)    1262.4    1.66x
+torch compile fp16 (batch 64)          979.7    1.29x
+torch eager fp16 (batch 64)            836.4    1.10x
+loom fp16 (batch 8)                    758.4    1.00x  <-- this repo
+loom fp16 (batch 64)                   710.8    0.94x  <-- this repo
+loom fp16 (batch 32)                   659.5    0.87x  <-- this repo
+torch max-autotune fp16 (batch 1)      493.2    0.65x
+loom fp16 (batch 1)                    440.6    0.58x  <-- this repo
+torch compile fp16 (batch 1)           386.6    0.51x
+torch eager fp16 (batch 1)             294.6    0.39x
+torch max-autotune fp32 (batch 64)     239.0    0.32x
+loom fp32 (batch 32)                   202.0    0.27x  <-- this repo
+torch compile fp32 (batch 64)          166.7    0.22x
+torch eager fp32 (batch 64)            148.6    0.20x
+torch max-autotune fp32 (batch 1)      125.5    0.17x
+torch compile fp32 (batch 1)           121.5    0.16x
+loom fp32 (batch 1)                    119.4    0.16x  <-- this repo
+torch eager fp32 (batch 1)             116.1    0.15x
