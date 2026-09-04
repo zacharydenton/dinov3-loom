@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     // inside this machine's run-to-run variance, so the default keeps the
     // simpler single-tile path and the flag is here to re-measure on an idle box.
     int repeat = 1, batch = 1, wide_threshold = 1 << 30;
-    bool wmma = true;
+    bool wmma = true, flash_attn = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -138,6 +138,7 @@ int main(int argc, char **argv) {
         else if (a == "--wide-threshold") wide_threshold = std::stoi(next());
         else if (a == "--profile") g_profile = true;
         else if (a == "--f32") wmma = false;
+        else if (a == "--no-flash") flash_attn = false;
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -171,7 +172,7 @@ int main(int argc, char **argv) {
     Kernel layernorm, rope, attention, swiglu, residual;
     Kernel matmul_patch, matmul_qkvo, matmul_qkv, matmul_gateup, matmul_down, scatter;
     Kernel matmul_qkvo_wide, matmul_down_wide;
-    Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down;
+    Kernel wmma_patch, wmma_qkv, wmma_o, wmma_gateup, wmma_down, flash;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -190,6 +191,7 @@ int main(int argc, char **argv) {
     wmma_o.load(kernels_dir, "wmma_k384_n384", "dinov3_matmul_bias_f16_wmma");
     wmma_gateup.load(kernels_dir, "wmma_k384_n3072", "dinov3_matmul_bias_f16_wmma");
     wmma_down.load(kernels_dir, "wmma_k1536_n384", "dinov3_matmul_bias_f16_wmma");
+    flash.load(kernels_dir, "flash_attention", "dinov3_flash_attention_f16_wmma");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -264,8 +266,13 @@ int main(int argc, char **argv) {
                 KernArgs args;
                 args.scalar_i32(rows);
                 args.pointer(q); args.pointer(k); args.pointer(v); args.pointer(attn);
-                // One workgroup per (block of 8 queries within an image, head).
-                launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
+                if (wmma && flash_attn) {
+                    // One workgroup per (16 query rows within an image, head).
+                    launch(flash.function, batch * ((TOKENS + 15) / 16), HEADS, args);
+                } else {
+                    // One workgroup per (block of 8 queries within an image, head).
+                    launch(attention.function, batch * ((TOKENS + 7) / 8), HEADS, args);
+                }
             }
             { Stage stage("o matmul");
               matmul(wmma ? wmma_o : proj_kernel, rows, HIDDEN, attn,

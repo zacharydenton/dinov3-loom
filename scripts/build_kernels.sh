@@ -28,6 +28,11 @@ compile attention_f32 dinov3_attention_f32 attention \
 compile embed_scatter_f32 dinov3_embed_scatter_f32 embed_scatter \
   dinov3.embed_scatter_f32.hidden_size=384 dinov3.embed_scatter_f32.tokens_per_image=201 \
   dinov3.embed_scatter_f32.prefix=5
+compile flash_attention_f16_wmma dinov3_flash_attention_f16_wmma flash_attention \
+  dinov3.flash_attention_f16_wmma.hidden_size=384 \
+  dinov3.flash_attention_f16_wmma.qkv_stride=1152 \
+  dinov3.flash_attention_f16_wmma.tokens_per_image=201 \
+  dinov3.flash_attention_f16_wmma.scale=0.125
 compile swiglu_f32 dinov3_swiglu_f32 swiglu dinov3.swiglu_f32.width=1536 \
   dinov3.swiglu_f32.row_stride=3072
 compile residual_scale_f32 dinov3_residual_scale_f32 residual \
