@@ -68,22 +68,26 @@ means both sides saw the same contention.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 1262.4 | 1.66x |
-| torch compile fp16, batch 64 | 979.7 | 1.29x |
-| torch eager fp16, batch 64 | 836.4 | 1.10x |
-| **loom fp16, batch 8** | **758.4** | **1.00x** |
-| **loom fp16, batch 64** | **710.8** | 0.94x |
-| **loom fp16, batch 32** | **659.5** | 0.87x |
-| torch max-autotune fp16, batch 1 | 493.2 | 0.65x |
-| **loom fp16, batch 1** | **440.6** | 0.58x |
-| torch compile fp16, batch 1 | 386.6 | 0.51x |
-| torch eager fp16, batch 1 | 294.6 | 0.39x |
-| torch max-autotune fp32, batch 64 | 239.0 | 0.32x |
-| **loom fp32, batch 32** | **202.0** | 0.27x |
-| torch compile fp32, batch 64 | 166.7 | 0.22x |
-| torch eager fp32, batch 64 | 148.6 | 0.20x |
-| **loom fp32, batch 1** | **119.4** | 0.16x |
-| torch eager fp32, batch 1 | 116.1 | 0.15x |
+| torch max-autotune fp16, batch 64 | 1278.6 | 1.64x |
+| torch compile fp16, batch 64 | 1117.0 | 1.44x |
+| torch eager fp16, batch 64 | 838.8 | 1.08x |
+| **loom fp16, batch 32** | **778.3** | **1.00x** |
+| **loom fp16, batch 8** | **765.8** | 0.98x |
+| **loom fp16, batch 64** | **732.8** | 0.94x |
+| torch max-autotune fp16, batch 1 | 599.7 | 0.77x |
+| **loom fp16, batch 1** | **368.9** | 0.47x |
+| torch compile fp16, batch 1 | 340.8 | 0.44x |
+| torch eager fp16, batch 1 | 294.7 | 0.38x |
+| torch max-autotune fp32, batch 64 | 234.6 | 0.30x |
+| **loom fp32, batch 32** | **219.6** | 0.28x |
+| torch compile fp32, batch 64 | 167.8 | 0.22x |
+| torch eager fp32, batch 64 | 148.9 | 0.19x |
+| **loom fp32, batch 1** | **119.4** | 0.15x |
+| torch eager fp32, batch 1 | 115.4 | 0.15x |
+
+Measured with `gpu_busy_percent` at 0 before the run, unlike the earlier tables
+in this file's history. `docs/inductor-teardown.md` explains where torch's
+remaining 1.64x comes from -- it is the matmul k-loop and AOTriton, not fusion.
 
 Read it honestly:
 
@@ -91,7 +95,7 @@ Read it honestly:
   torch's best of any batch is beaten too.
 - **At fp16 it is within 10% of `torch.eager` at batch 64** (758.4 vs 836.4) while
   running batches of 8. `torch.compile` is 1.29x ahead and `max-autotune` 1.66x.
-- **Batch 32 measuring below batch 8 and 64 is noise, not a curve.** Individual
+- **The batch curve is flat from 8 upward** (766 / 778 / 733 at 8 / 32 / 64) on an idle machine; batch 1 costs about half the throughput. Individual
   samples for one configuration have ranged 115 to 243 img/s on this machine
   during other work. Treat anything inside ~20% as a tie, and rerun on an idle
   box before drawing conclusions.
