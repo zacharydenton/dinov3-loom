@@ -13,13 +13,18 @@ import numpy as np
 from safetensors.numpy import load_file
 
 MODEL_ID = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
+# The exact revision every number in this repository was produced against.
+# Resolving a mutable branch would let the weights change under the tests.
+MODEL_REVISION = "c93d816fc9e567563bc068f01475bec89cc634a6"
 
 
-def _snapshot() -> Path:
+def snapshot() -> Path:
     """Locate the model, downloading it on first use.
 
-    DINOV3_SNAPSHOT overrides, for offline or vendored copies. Otherwise this
-    resolves through huggingface_hub, which caches under HF_HOME.
+    Deliberately not run at import: the kernel tests import this module only
+    for its constants and softmax, and must not need the model, a cache, or a
+    network. DINOV3_SNAPSHOT overrides, for offline or vendored copies.
+    Otherwise this resolves through huggingface_hub, which caches under HF_HOME.
     """
     override = os.environ.get("DINOV3_SNAPSHOT")
     if override:
@@ -29,13 +34,10 @@ def _snapshot() -> Path:
     except ImportError:  # pragma: no cover - dependency guidance
         raise SystemExit(
             "huggingface_hub is required to resolve the model. Install the "
-            "dependencies (pip install -r requirements.txt), or point "
+            "validation dependencies (pip install -r requirements.txt), or point "
             "DINOV3_SNAPSHOT at an existing snapshot directory."
         )
-    return Path(snapshot_download(MODEL_ID))
-
-
-SNAPSHOT = _snapshot()
+    return Path(snapshot_download(MODEL_ID, revision=MODEL_REVISION))
 
 HIDDEN = 384
 HEADS = 6
@@ -53,7 +55,8 @@ EPS = 1e-5
 ROPE_THETA = 100.0
 
 
-def load_weights(path: Path = SNAPSHOT / "model.safetensors") -> dict[str, np.ndarray]:
+def load_weights(path: Path | None = None) -> dict[str, np.ndarray]:
+    path = path or snapshot() / "model.safetensors"
     return {k: v.astype(np.float64) for k, v in load_file(str(path)).items()}
 
 

@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # reference
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # dinov3_loom
 import reference as R
 from dinov3_loom import DINOv3Loom
 
@@ -37,7 +38,7 @@ def main() -> int:
     from transformers import AutoModel
 
     batch = np.stack([image(s) for s in range(4)])
-    hf = AutoModel.from_pretrained(str(R.SNAPSHOT)).eval()
+    hf = AutoModel.from_pretrained(str(R.snapshot())).eval()
     with torch.no_grad():
         want = hf(pixel_values=torch.from_numpy(batch)).last_hidden_state.numpy()
     got = DINOv3Loom()(batch)

@@ -28,7 +28,7 @@ def main() -> None:
     print(f"torch {torch.__version__}  device {torch.cuda.get_device_name(0)}")
     rows = []
     for dtype_name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
-        model = AutoModel.from_pretrained(str(R.SNAPSHOT), dtype=dtype).eval().cuda()
+        model = AutoModel.from_pretrained(str(R.snapshot()), dtype=dtype).eval().cuda()
         for batch in (1, 8, 64):
             rows.append((f"eager {dtype_name}", batch, bench(model, batch, dtype)))
             print(f"  {rows[-1][0]:<16s} batch={batch:<3d} {rows[-1][2]:8.2f} img/s", flush=True)

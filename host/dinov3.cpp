@@ -69,20 +69,39 @@ std::map<std::string, Span> read_manifest(const std::string &path) {
     return spans;
 }
 
-// A manifest is generated data, but it is still input: a truncated or mismatched
-// blob would otherwise be read past its end.
-void check_manifest(const std::map<std::string, Span> &spans, size_t blob_bytes,
-                    size_t element_bytes, const char *what) {
+// A manifest is generated data, but it is still input. Two things are checked:
+// every span lies inside the blob, with the offset and count multiplications
+// both overflow-checked; and every tensor the forward pass will read is present
+// with exactly the element count the kernels are compiled for. The kernels take
+// bare pointers and never see Span.count, so a manifest that declared patch_w
+// as one element at the end of the blob would otherwise pass the bounds check
+// and have the kernel read 294,911 elements past the allocation.
+void check_spans(const std::map<std::string, Span> &spans, size_t blob_bytes,
+                 size_t element_bytes, const char *what) {
     for (const auto &entry : spans) {
-        size_t end;
-        if (__builtin_mul_overflow(entry.second.count, element_bytes, &end) ||
-            __builtin_add_overflow(entry.second.offset * element_bytes, end, &end) ||
-            end > blob_bytes) {
+        size_t begin, extent, end;
+        if (__builtin_mul_overflow(entry.second.offset, element_bytes, &begin) ||
+            __builtin_mul_overflow(entry.second.count, element_bytes, &extent) ||
+            __builtin_add_overflow(begin, extent, &end) || end > blob_bytes) {
             fprintf(stderr, "%s: span '%s' (offset %zu, count %zu) runs past the "
                             "%zu-byte blob\n", what, entry.first.c_str(),
                     entry.second.offset, entry.second.count, blob_bytes);
             exit(1);
         }
+    }
+}
+
+void require(const std::map<std::string, Span> &spans, const std::string &name,
+             size_t count, const char *what) {
+    auto it = spans.find(name);
+    if (it == spans.end()) {
+        fprintf(stderr, "%s: missing tensor '%s'\n", what, name.c_str());
+        exit(1);
+    }
+    if (it->second.count != count) {
+        fprintf(stderr, "%s: tensor '%s' has %zu elements, the kernels expect %zu\n",
+                what, name.c_str(), it->second.count, count);
+        exit(1);
     }
 }
 
@@ -134,63 +153,112 @@ void launch(hipFunction_t function, unsigned gx, unsigned gy, KernArgs &args) {
     launchBlock(function, gx, gy, THREADS, args);
 }
 
-}  // namespace
 
-int main(int argc, char **argv) {
-    std::string weights_dir = "build/weights", kernels_dir = "build/kernels";
-    std::string input_path, output_path;
-    int repeat = 1, batch = 1;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() {
-            if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", a.c_str()); exit(64); }
-            return std::string(argv[++i]);
-        };
-        if (a == "--weights") weights_dir = next();
-        else if (a == "--kernels") kernels_dir = next();
-        else if (a == "--input") input_path = next();
-        else if (a == "--output") output_path = next();
-        else if (a == "--repeat") repeat = std::stoi(next());
-        else if (a == "--batch") batch = std::stoi(next());
-        else if (a == "--profile") g_profile = true;
-        else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
+// ---------------------------------------------------------------------------
+// Resident session. These were locals in main(); they are file scope now so the
+// launch helpers and the forward pass below keep the bodies they always had,
+// and so a caller can init once and run many batches against the same context.
+// ---------------------------------------------------------------------------
+std::map<std::string, Span> spans, spans16;
+float *weights = nullptr;
+unsigned short *weights16 = nullptr;
+Kernel scatter, wmma_patch, qkv_rope, attn_online, resid_o, resid_down;
+Kernel wmma_swiglu, splitk_down, splitk_reduce, ln_rowwave, ln_rowwave_f32;
+float *x, *h, *q, *k, *v, *attn, *act, *out, *image, *patched, *partials;
+// The online attention kernel bounds its image index with a compiled
+// max_images so the fragment loads prove in range; beyond it the modulo
+// would silently fold later images onto earlier ones.
+constexpr int MAX_IMAGES = 64;
+// Split the down projection's k range when the batch is too small to fill
+// the machine: at batch 1 it otherwise launches 24 workgroups against ~120
+// slots. Measured 1.54x there and a loss from batch 2 up.
+constexpr int SPLITS = 4;
+int session_max_batch = 0;
+int batch = 0, rows = 0, patch_rows = 0;
+bool use_splitk = false;
+
+float *W(const std::string &name) {
+    auto it = spans.find(name);
+    if (it == spans.end()) { fprintf(stderr, "missing weight %s\n", name.c_str()); exit(1); }
+    return weights + it->second.offset;
+}
+unsigned short *W16(const std::string &name) {
+    auto it = spans16.find(name);
+    if (it == spans16.end()) { fprintf(stderr, "missing f16 weight %s\n", name.c_str()); exit(1); }
+    return weights16 + it->second.offset;
+}
+// Projection weights come from the f16 blob under WMMA, the f32 one otherwise.
+const void *PW(const std::string &name) { return (const void *)W16(name); }
+
+// Sizing for one call. Buffers are allocated for the session maximum, so this
+// only moves the launch bounds; nothing is reallocated between batches.
+bool set_batch(int b) {
+    if (b < 1 || b > session_max_batch) {
+        fprintf(stderr, "batch %d out of range 1..%d\n", b, session_max_batch);
+        return false;
+    }
+    batch = b;
+    rows = batch * TOKENS;
+    patch_rows = batch * PATCHES;
+    use_splitk = rows <= TOKENS;
+    return true;
+}
+
+// Bring up the device, upload the weights and load the kernels. Buffers are
+// sized for `max_batch` and reused, so every later run is launches and two
+// copies -- which is the whole point of holding the session open: the work
+// below is ~100ms and used to be paid once per call.
+int session_init(const char *weights_dir_c, const char *kernels_dir_c, int max_batch) {
+    std::string weights_dir(weights_dir_c), kernels_dir(kernels_dir_c);
+    if (max_batch < 1 || max_batch > MAX_IMAGES) {
+        fprintf(stderr, "max_batch must be 1..%d (the kernels' compiled max_images)\n", MAX_IMAGES);
+        return 64;
+    }
+    session_max_batch = max_batch;
+    const int max_rows = max_batch * TOKENS;
+    const int max_patch_rows = max_batch * PATCHES;
+
+    spans = read_manifest(weights_dir + "/manifest.txt");
+    auto blob = read_file(weights_dir + "/weights.bin");
+    spans16 = read_manifest(weights_dir + "/manifest_f16.txt");
+    auto blob16 = read_file(weights_dir + "/weights_f16.bin");
+    check_spans(spans, blob.size(), sizeof(float), "manifest.txt");
+    check_spans(spans16, blob16.size(), sizeof(uint16_t), "manifest_f16.txt");
+    {
+        const char *f32 = "manifest.txt", *f16 = "manifest_f16.txt";
+        const size_t H = HIDDEN, I = INTERMEDIATE;
+        require(spans16, "patch_w", H * PATCH_K, f16);
+        require(spans, "patch_b", H, f32);
+        require(spans, "prefix", size_t(PREFIX) * H, f32);
+        require(spans, "rope_cos", size_t(PATCHES) * (H / HEADS), f32);
+        require(spans, "rope_sin", size_t(PATCHES) * (H / HEADS), f32);
+        for (int layer = 0; layer < LAYERS; ++layer) {
+            std::string p = "l" + std::to_string(layer) + "_";
+            require(spans16, p + "qkv_w", size_t(QKV) * H, f16);
+            require(spans16, p + "o_w", H * H, f16);
+            require(spans16, p + "gateup_w", 2 * I * H, f16);
+            require(spans16, p + "down_w", H * I, f16);
+            require(spans, p + "qkv_b", QKV, f32);
+            require(spans, p + "o_b", H, f32);
+            require(spans, p + "gateup_b", 2 * I, f32);
+            require(spans, p + "down_b", H, f32);
+            for (const char *v : {"ls1", "ls2", "norm1_w", "norm1_b", "norm2_w", "norm2_b"})
+                require(spans, p + v, H, f32);
+        }
+        require(spans, "norm_w", H, f32);
+        require(spans, "norm_b", H, f32);
     }
 
-    auto spans = read_manifest(weights_dir + "/manifest.txt");
-    auto blob = read_file(weights_dir + "/weights.bin");
-    auto spans16 = read_manifest(weights_dir + "/manifest_f16.txt");
-    auto blob16 = read_file(weights_dir + "/weights_f16.bin");
-    check_manifest(spans, blob.size(), sizeof(float), "manifest.txt");
-    check_manifest(spans16, blob16.size(), sizeof(uint16_t), "manifest_f16.txt");
-
     HIP_CHECK(hipInit(0));
-    float *weights = nullptr;
     HIP_CHECK(hipMalloc(&weights, blob.size()));
     HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)weights, blob.data(), blob.size()));
-    auto W = [&](const std::string &name) -> float * {
-        auto it = spans.find(name);
-        if (it == spans.end()) { fprintf(stderr, "missing weight %s\n", name.c_str()); exit(1); }
-        return weights + it->second.offset;
-    };
-    unsigned short *weights16 = nullptr;
     HIP_CHECK(hipMalloc(&weights16, blob16.size()));
     HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)weights16, blob16.data(), blob16.size()));
-    auto W16 = [&](const std::string &name) -> unsigned short * {
-        auto it = spans16.find(name);
-        if (it == spans16.end()) { fprintf(stderr, "missing f16 weight %s\n", name.c_str()); exit(1); }
-        return weights16 + it->second.offset;
-    };
-    // Projection weights come from the f16 blob under WMMA, the f32 one otherwise.
-    auto PW = [&](const std::string &name) -> const void * {
-        return (const void *)W16(name);   // every matmul takes f16 weights
-    };
 
     // One configuration, so one kernel set. Earlier revisions carried f32,
     // non-fused and non-WMMA fallbacks selectable by flag; they multiplied the
     // dtype/layout combinations far past what was tested and several were
     // silently wrong. The measured-best path is the only path.
-    Kernel scatter, wmma_patch, qkv_rope, attn_online, resid_o, resid_down;
-    Kernel wmma_swiglu, splitk_down, splitk_reduce, ln_rowwave, ln_rowwave_f32;
     scatter.load(kernels_dir, "embed_scatter", "dinov3_embed_scatter_f32");
     wmma_patch.load(kernels_dir, "wmma_k768_n384", "dinov3_matmul_bias_f16_wmma");
     qkv_rope.load(kernels_dir, "qkv_rope_k384_n1152", "dinov3_matmul_qkv_rope_f16_wmma");
@@ -203,101 +271,57 @@ int main(int argc, char **argv) {
     ln_rowwave.load(kernels_dir, "layernorm_rowwave", "dinov3_layernorm_rowwave_f16");
     ln_rowwave_f32.load(kernels_dir, "layernorm_rowwave_f32out", "dinov3_layernorm_rowwave_f32out");
 
-    // The online attention kernel bounds its image index with a compiled
-    // max_images so the fragment loads prove in range; beyond it the modulo
-    // would silently fold later images onto earlier ones.
-    constexpr int MAX_IMAGES = 64;
-    if (batch < 1 || batch > MAX_IMAGES) {
-        fprintf(stderr, "--batch must be 1..%d (the kernels' compiled max_images)\n",
-                MAX_IMAGES);
-        return 64;
-    }
-    const int rows = batch * TOKENS;          // residual-stream rows
-    const int patch_rows = batch * PATCHES;
-    // Split the down projection's k range when the batch is too small to fill
-    // the machine: at batch 1 it otherwise launches 24 workgroups against ~120
-    // slots. Measured 1.54x there and a loss from batch 2 up.
-    const int SPLITS = 4;
-    const bool use_splitk = rows <= TOKENS;
 
-    float *x, *h, *q, *k, *v, *attn, *act, *out, *image, *patched;
     auto alloc = [](float **p, size_t floats) { HIP_CHECK(hipMalloc(p, floats * sizeof(float))); };
     // Every intermediate is f16, so the float-typed pointers are half-width
     // views of these buffers; the allocations below are generous by exactly
     // that factor rather than being tightened, which keeps the arithmetic here
     // obvious.
-    alloc(&x, size_t(rows) * HIDDEN);      alloc(&h, size_t(rows) * HIDDEN);
+    alloc(&x, size_t(max_rows) * HIDDEN);      alloc(&h, size_t(max_rows) * HIDDEN);
     // A query tile may overhang the last image by up to 15 rows; the online
     // attention kernel masks those lanes but still forms the address.
-    alloc(&q, size_t(rows + 16) * QKV);    alloc(&attn, size_t(rows) * HIDDEN);
-    alloc(&act, size_t(rows) * INTERMEDIATE);  alloc(&out, size_t(rows) * HIDDEN);
-    alloc(&patched, size_t(patch_rows) * HIDDEN);
-    alloc(&image, size_t(patch_rows) * PATCH_K);
-    float *partials = nullptr;
-    if (use_splitk) alloc(&partials, size_t(SPLITS) * rows * HIDDEN);
+    alloc(&q, size_t(max_rows + 16) * QKV);    alloc(&attn, size_t(max_rows) * HIDDEN);
+    alloc(&act, size_t(max_rows) * INTERMEDIATE);  alloc(&out, size_t(max_rows) * HIDDEN);
+    alloc(&patched, size_t(max_patch_rows) * HIDDEN);
+    alloc(&image, size_t(max_patch_rows) * PATCH_K);
+    // split-K runs only at batch 1, where rows == TOKENS
+    alloc(&partials, size_t(SPLITS) * TOKENS * HIDDEN);
     // q/k/v are f16, so the head offsets are half as many float-sized steps.
     const int qkv_step = HIDDEN / 2;
     k = q + qkv_step; v = q + 2 * qkv_step;
 
-    {
-        // The input holds either one patchified image, which is replicated to
-        // fill the batch (how the benchmarks are run), or exactly `batch` of
-        // them, which is how inference is run.
-        if (input_path.empty()) {
-            fprintf(stderr, "--input is required: %d x %d f32 per image, either one "
-                            "image or exactly --batch of them (tools/dinov3_loom.py "
-                            "writes this)\n", PATCHES, PATCH_K);
-            return 64;
-        }
-        const size_t per_image = size_t(PATCHES) * PATCH_K * sizeof(float);
-        auto pixels = read_file(input_path);
-        if (pixels.size() % per_image != 0) {
-            fprintf(stderr, "%s is %zu bytes, not a multiple of %zu (%d patches x %d f32)\n",
-                    input_path.c_str(), pixels.size(), per_image, PATCHES, PATCH_K);
-            return 64;
-        }
-        const size_t supplied = pixels.size() / per_image;
-        if (supplied != 1 && supplied != size_t(batch)) {
-            fprintf(stderr, "%s holds %zu images; expected 1 (replicated) or %d (--batch)\n",
-                    input_path.c_str(), supplied, batch);
-            return 64;
-        }
-        for (int b = 0; b < batch; ++b) {
-            const char *src = pixels.data() + (supplied == 1 ? 0 : size_t(b) * per_image);
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)(image + size_t(b) * PATCHES * PATCH_K),
-                                    (void *)src, per_image));
-        }
-    }
+    return 0;
+}
 
-    auto matmul = [&](Kernel &kernel, int m, int n, const float *a, const void *w,
-                      const float *bias, float *c, int tile_n = TILE) {
+void matmul(Kernel &kernel, int m, int n, const float *a, const void *w,
+            const float *bias, float *c, int tile_n = TILE) {
         KernArgs args;
         args.scalar_i32(m);
         args.pointer(a); args.pointer(w); args.pointer(bias); args.pointer(c);
         launch(kernel.function, n / tile_n, (m + TILE - 1) / TILE, args);
-    };
+}
     // A@W + bias scaled by lambda and accumulated into the residual stream.
-    auto matmul_resid = [&](Kernel &kernel, int m, int n, const float *a, const void *w,
-                            const float *bias, float *stream, const float *lambda) {
+void matmul_resid(Kernel &kernel, int m, int n, const float *a, const void *w,
+                  const float *bias, float *stream, const float *lambda) {
         KernArgs args;
         args.scalar_i32(m);
         args.pointer(a); args.pointer(w); args.pointer(bias);
         args.pointer(stream); args.pointer(lambda);
         launch(kernel.function, n / TILE, (m + TILE - 1) / TILE, args);
-    };
+}
     // `dst` is f16, so callers treat it as opaque.
-    auto norm = [&](const float *in, const float *gamma, const float *beta, void *dst,
-                    bool wide_out) {
+void norm(const float *in, const float *gamma, const float *beta, void *dst,
+          bool wide_out) {
         KernArgs args;
         args.scalar_i32(rows);
         args.pointer(in); args.pointer(gamma); args.pointer(beta); args.pointer(dst);
         // One row per wave, so eight rows per workgroup.
         launch(wide_out ? ln_rowwave_f32.function : ln_rowwave.function,
                (rows + 7) / 8, 1, args);
-    };
+}
 
 
-    auto forward = [&]() {
+void forward() {
         // Patch embedding writes straight into the residual stream behind the
         // CLS and register tokens, so no copy is needed afterwards.
         { Stage stage("patch-embed matmul");
@@ -378,7 +402,95 @@ int main(int argc, char **argv) {
         }
         // The final norm writes f32.
         { Stage stage("layernorm"); norm(x, W("norm_w"), W("norm_b"), out, true); }
-    };
+}
+
+
+// One batch: upload, run, download. `input` is batch x PATCHES x PATCH_K f32,
+// `output` is batch x TOKENS x HIDDEN f32.
+int session_run(const float *input, float *output, int b) {
+    if (!set_batch(b)) return 64;
+    HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)image, (void *)input,
+                            size_t(patch_rows) * PATCH_K * sizeof(float)));
+    forward();
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpyDtoH(output, (hipDeviceptr_t)out,
+                            size_t(rows) * HIDDEN * sizeof(float)));
+    return 0;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// C API, for callers that hold the session open rather than paying init per
+// batch. The same file still builds the CLI; main() below just drives these.
+//
+//   dinov3_init(weights_dir, kernels_dir, max_batch)  -> 0 on success
+//   dinov3_run(input, output, batch)                  -> 0 on success
+//
+// `input`  is batch x 196 x 768 f32, contiguous, patchified.
+// `output` is batch x 201 x 384 f32, written by the caller's allocation.
+// Not thread-safe: one session, one device context, one caller at a time.
+// ---------------------------------------------------------------------------
+extern "C" int dinov3_init(const char *weights_dir, const char *kernels_dir, int max_batch) {
+    return session_init(weights_dir, kernels_dir, max_batch);
+}
+extern "C" int dinov3_run(const float *input, float *output, int batch) {
+    return session_run(input, output, batch);
+}
+extern "C" int dinov3_max_batch(void) { return session_max_batch; }
+
+int main(int argc, char **argv) {
+    std::string weights_dir = "build/weights", kernels_dir = "build/kernels";
+    std::string input_path, output_path;
+    int repeat = 1, batch = 1;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() {
+            if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", a.c_str()); exit(64); }
+            return std::string(argv[++i]);
+        };
+        if (a == "--weights") weights_dir = next();
+        else if (a == "--kernels") kernels_dir = next();
+        else if (a == "--input") input_path = next();
+        else if (a == "--output") output_path = next();
+        else if (a == "--repeat") repeat = std::stoi(next());
+        else if (a == "--batch") batch = std::stoi(next());
+        else if (a == "--profile") g_profile = true;
+        else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
+    }
+
+    if (int rc = session_init(weights_dir.c_str(), kernels_dir.c_str(), batch)) return rc;
+    if (!set_batch(batch)) return 64;
+
+    {
+        // The input holds either one patchified image, which is replicated to
+        // fill the batch (how the benchmarks are run), or exactly `batch` of
+        // them, which is how inference is run.
+        if (input_path.empty()) {
+            fprintf(stderr, "--input is required: %d x %d f32 per image, either one "
+                            "image or exactly --batch of them (tools/dinov3_loom.py "
+                            "writes this)\n", PATCHES, PATCH_K);
+            return 64;
+        }
+        const size_t per_image = size_t(PATCHES) * PATCH_K * sizeof(float);
+        auto pixels = read_file(input_path);
+        if (pixels.size() % per_image != 0) {
+            fprintf(stderr, "%s is %zu bytes, not a multiple of %zu (%d patches x %d f32)\n",
+                    input_path.c_str(), pixels.size(), per_image, PATCHES, PATCH_K);
+            return 64;
+        }
+        const size_t supplied = pixels.size() / per_image;
+        if (supplied != 1 && supplied != size_t(batch)) {
+            fprintf(stderr, "%s holds %zu images; expected 1 (replicated) or %d (--batch)\n",
+                    input_path.c_str(), supplied, batch);
+            return 64;
+        }
+        for (int b = 0; b < batch; ++b) {
+            const char *src = pixels.data() + (supplied == 1 ? 0 : size_t(b) * per_image);
+            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)(image + size_t(b) * PATCHES * PATCH_K),
+                                    (void *)src, per_image));
+        }
+    }
 
     forward();
     HIP_CHECK(hipDeviceSynchronize());

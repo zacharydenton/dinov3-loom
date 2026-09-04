@@ -42,7 +42,7 @@ def main() -> int:
     import torch
     from transformers import AutoModel
 
-    model = AutoModel.from_pretrained(str(R.SNAPSHOT), dtype=torch.float32).eval()
+    model = AutoModel.from_pretrained(str(R.snapshot()), dtype=torch.float32).eval()
     ok = True
     for seed in (0, 1, 2):
         image = make_image(seed)

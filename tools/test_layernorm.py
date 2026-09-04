@@ -1,4 +1,6 @@
-"""layernorm_rowwave_f16 vs a float64 NumPy reference."""
+"""layernorm_rowwave_f16 and _f32out vs a float64 NumPy reference.
+
+The f16-out kernel feeds every matmul; the f32-out one is the final norm."""
 import sys
 from pathlib import Path
 
@@ -17,26 +19,30 @@ def main() -> int:
     with workdir() as tmp:
         tmp = Path(tmp)
         hsaco = tmp / "layernorm.hsaco"
-        compile_kernel(ROOT / "kernels/layernorm_rowwave_f16.loom", "dinov3_layernorm_rowwave_f16",
-                       {"dinov3.layernorm_rowwave_f16.hidden_size": HIDDEN,
-                        "dinov3.layernorm_rowwave_f16.epsilon": EPS}, hsaco)
-        print(f"compiled layernorm_rowwave_f16 for hidden={HIDDEN}")
         rng = np.random.default_rng(0)
-        for tokens in CASES:
+        for variant, out_kind, out_dtype in (("f16", "out_f16", np.float16),
+                                             ("f32out", "out", np.float32)):
+          name = f"dinov3_layernorm_rowwave_{variant}"
+          hsaco = tmp / f"{variant}.hsaco"
+          compile_kernel(ROOT / f"kernels/layernorm_rowwave_{variant}.loom", name,
+                         {f"dinov3.layernorm_rowwave_{variant}.hidden_size": HIDDEN,
+                          f"dinov3.layernorm_rowwave_{variant}.epsilon": EPS}, hsaco)
+          print(f"compiled {name} for hidden={HIDDEN}")
+          for tokens in CASES:
             # layernorm reads the residual stream, which is f16.
             x = (rng.standard_normal((tokens, HIDDEN), dtype=np.float32) * 3.0 + 1.5).astype(np.float16)
             gamma = rng.standard_normal(HIDDEN, dtype=np.float32)
             beta = rng.standard_normal(HIDDEN, dtype=np.float32)
             (y,), timing = launch(
-                hsaco, "dinov3_layernorm_rowwave_f16", ((tokens + 7) // 8, 1, 1), (256, 1, 1),
+                hsaco, name, ((tokens + 7) // 8, 1, 1), (256, 1, 1),
                 [("i32", tokens), ("in_f16", x), ("in", gamma), ("in", beta),
-                 ("out_f16", ((tokens, HIDDEN), np.float16))],
+                 (out_kind, ((tokens, HIDDEN), out_dtype))],
                 tmp, repeat=50)
             xd = x.astype(np.float64)
             mean = xd.mean(axis=1, keepdims=True)
             var = xd.var(axis=1, keepdims=True)
             expected = ((xd - mean) / np.sqrt(var + EPS) * gamma + beta)
-            ok &= report(f"tokens={tokens:<5d} ({timing['per_launch_us']:7.2f} us)", y, expected,
+            ok &= report(f"{variant:<6s} tokens={tokens:<5d} ({timing['per_launch_us']:7.2f} us)", y, expected,
                          atol=2e-3, rtol=2e-3)
     return 0 if ok else 1
 

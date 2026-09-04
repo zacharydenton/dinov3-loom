@@ -67,9 +67,9 @@ For scale: xdna-vision gates DINOv3 at cosine > 0.997. `tools/test_batch.py`
 repeats this for four distinct images in one batched call.
 
 `tools/reference.py` is an independent float64 NumPy implementation of the whole
-architecture, agreeing with transformers to 9.3e-06. Every individual kernel is
-graded against it, not against torch, so a kernel bug cannot hide behind a
-matching bug in the harness.
+architecture, agreeing with transformers to 9.3e-06. Every kernel that ships
+has a unit test graded against it, not against torch, so a kernel bug cannot
+hide behind a matching bug in the harness. `scripts/test.sh` runs them all.
 
 ## Benchmark
 
@@ -193,9 +193,10 @@ On Arch, see `docs/notes.md` — the distro's `hsa-rocr` aborts under HRX and
 
 ## Replacing a PyTorch DINOv3
 
-`tools/dinov3_loom.py` takes the same `pixel_values` an HF image processor
-produces and returns the same array as `last_hidden_state`. The swap is two
-lines:
+`dinov3_loom.py` takes the same `pixel_values` an HF image processor produces
+and returns the same array as `last_hidden_state`. It is a single module at the
+repository root: `pip install -e .` makes it importable from anywhere, or run
+from the root and it is on the path already. The swap is two lines:
 
 ```python
 # before

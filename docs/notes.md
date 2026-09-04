@@ -980,3 +980,46 @@ swapped pointer cannot pass; every `.loom` file is canonically formatted and
 `scripts/test.sh` is the single entry point: format, build, generator
 reproducibility, four unit suites against float64 NumPy, the runners' error
 paths, and the end-to-end comparison against transformers.
+
+## Second review round
+
+Seven findings against the release commit; all confirmed, all addressed.
+
+**The Python API could not be imported as documented.** The module lived under
+`tools/` and only `test_batch.py`'s `sys.path` hack could reach it. It is now
+`dinov3_loom.py` at the repository root, with a `pyproject.toml` (`pip install
+-e .`), so the README's `from dinov3_loom import DINOv3Loom` is true from the
+root with no install and from anywhere with one. Custom paths are resolved
+against the caller's cwd in `__init__`, since the subprocess runs with
+`cwd=ROOT`; an empty batch is an explicit `ValueError`.
+
+**Manifest validation checked the declared span, not the tensor.** The kernels
+take bare pointers and never see `Span.count`, so a manifest declaring `patch_w`
+as one element at the end of the blob passed the bounds check and let the kernel
+read 294,911 elements past it. And `offset * element_bytes` was computed outside
+the overflow check. Now every span is checked with both multiplications
+overflow-guarded, *and* every one of the 137 tensors the forward pass reads is
+required to be present with exactly the element count the kernels are compiled
+for. Verified by lying in a copied manifest both ways.
+
+**`test.sh` could test stale binaries** (it built only when none existed) and
+its error-path checks proved only that a phrase appeared, not that the command
+failed. Host programs are now always rebuilt with `-Wall -Werror`; each error
+path asserts exit status 64 *and* the diagnostic; the generator check writes to
+a scratch file and diffs instead of overwriting the tracked source.
+
+**Importing `reference.py` fetched the model.** Snapshot resolution ran at import,
+so the kernel tests -- which need only its constants and `softmax` -- contacted
+the Hub. It is a function now, `snapshot()`, called only by the paths that load
+weights, and pinned to the revision every number here was produced against
+rather than resolving `main`.
+
+**Split-K accepted `splits=3`**, which violates the 32*splits divisibility. It is
+now exactly 4, the only value used; a different count is a deliberate edit.
+
+**Coverage was overstated.** "Every individual kernel is graded" was untrue:
+embed_scatter, the f32-output LayerNorm, the fused SwiGLU matmul and the
+generated cf16 attention kernel had no direct test. They do now -- and the
+embed_scatter test allocates the prefix tensor at exactly 5 rows, so the
+original over-read would fault instead of being silently discarded, which is
+precisely what end-to-end validation could not detect.

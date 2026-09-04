@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 
 GRID, PATCH = 14, 16
 PATCHES = GRID * GRID          # 196
@@ -48,9 +48,12 @@ class DINOv3Loom:
     def __init__(self, weights: str | Path | None = None,
                  kernels: str | Path | None = None,
                  runner: str | Path | None = None):
-        self.weights = Path(weights or ROOT / "build/weights")
-        self.kernels = Path(kernels or ROOT / "build/kernels")
-        self.runner = Path(runner or ROOT / "host/dinov3")
+        # Resolved against the caller's cwd *now*, because the subprocess runs
+        # with cwd=ROOT: a relative path that passed exists() here would
+        # otherwise fail there.
+        self.weights = Path(weights or ROOT / "build/weights").resolve()
+        self.kernels = Path(kernels or ROOT / "build/kernels").resolve()
+        self.runner = Path(runner or ROOT / "host/dinov3").resolve()
         for path, hint in ((self.runner, "hipcc -O2 -o host/dinov3 host/dinov3.cpp"),
                            (self.kernels, "./scripts/build_kernels.sh"),
                            (self.weights, "python3 tools/export_weights.py")):
@@ -63,6 +66,8 @@ class DINOv3Loom:
                            dtype=np.float32)
         if array.ndim == 3:
             array = array[None]
+        if array.ndim != 4 or len(array) == 0:
+            raise ValueError(f"expected (B, 3, 224, 224) with B >= 1, got {array.shape}")
         out = [self._run(array[i:i + MAX_BATCH])
                for i in range(0, len(array), MAX_BATCH)]
         return np.concatenate(out, axis=0)

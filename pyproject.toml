@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dinov3-loom"
+version = "0.1.0"
+description = "DINOv3 ViT-S+/16 forward pass in AMD's Loom kernel language for gfx1151"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.3"]
+
+[project.optional-dependencies]
+# Only the reference model, validation and benchmarks need these.
+validate = ["safetensors>=0.6", "huggingface_hub>=0.34", "torch>=2.9", "transformers>=5.0"]
+
+[tool.setuptools]
+py-modules = ["dinov3_loom"]

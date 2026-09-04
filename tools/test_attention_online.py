@@ -1,4 +1,5 @@
 """attention_online_f16_wmma (the hrx-demos shape) vs a float64 NumPy reference."""
+import itertools
 import sys
 from pathlib import Path
 
@@ -19,16 +20,21 @@ def main() -> int:
     rng = np.random.default_rng(5)
     with workdir() as tmp:
         tmp = Path(tmp)
-        for batch, stride in ((1, HID), (4, HID), (4, 3 * HID)):
-            hsaco = tmp / f"ao_{batch}_{stride}.hsaco"
-            compile_kernel(ROOT / "kernels/attention_online_f16_wmma.loom",
-                           "dinov3_attention_online_f16_wmma",
-                           {f"{PREFIX}.hidden_size": HID,
-                            f"{PREFIX}.qkv_stride": stride,
-                            f"{PREFIX}.tokens_per_image": T,
-                            f"{PREFIX}.scale": D ** -0.5,
-                            f"{PREFIX}.max_images": MAX_IMAGES,
-                            f"{PREFIX}.token_capacity": CAPACITY}, hsaco)
+        # The f32-output source, and the generated f16-output variant the
+        # model actually launches; every case runs against both.
+        VARIANTS = (("", "out", np.float32), ("_cf16", "out_f16", np.float16))
+        CASES = ((1, HID), (4, HID), (4, 3 * HID))
+        for (suffix, out_kind, out_dtype), (batch, stride) in itertools.product(VARIANTS, CASES):
+            symbol = "dinov3_attention_online_f16_wmma" + suffix
+            ns = PREFIX + suffix
+            hsaco = tmp / f"ao{suffix}_{batch}_{stride}.hsaco"
+            compile_kernel(ROOT / f"kernels/attention_online_f16_wmma{suffix}.loom", symbol,
+                           {f"{ns}.hidden_size": HID,
+                            f"{ns}.qkv_stride": stride,
+                            f"{ns}.tokens_per_image": T,
+                            f"{ns}.scale": D ** -0.5,
+                            f"{ns}.max_images": MAX_IMAGES,
+                            f"{ns}.token_capacity": CAPACITY}, hsaco)
             rows = batch * T
             # A query tile may overhang the last image by up to 15 rows; the
             # kernel masks those lanes but still forms the address, so the
@@ -39,9 +45,9 @@ def main() -> int:
             q, k, v = (rng.standard_normal((padded, stride), dtype=np.float32).astype(np.float16)
                        for _ in range(3))
             args = [("i32", rows), ("in_f16", q), ("in_f16", k), ("in_f16", v),
-                    ("out", ((rows, HID), np.float32))]
+                    (out_kind, ((rows, HID), out_dtype))]
             grid = (batch * ((T + 15) // 16), H, 1)
-            (o,), timing = launch(hsaco, "dinov3_attention_online_f16_wmma", grid,
+            (o,), timing = launch(hsaco, symbol, grid,
                                   (32, 1, 1), args, tmp, repeat=50)
             expected = np.empty((rows, HID), dtype=np.float64)
             for b in range(batch):
@@ -52,7 +58,7 @@ def main() -> int:
                 ctx = R.softmax((qh * D ** -0.5) @ kh.transpose(0, 2, 1)) @ vh
                 expected[sl] = ctx.transpose(1, 0, 2).reshape(T, HID)
             flops = batch * H * (2.0 * T * T * D * 2)
-            ok &= report(f"batch={batch} stride={stride:5d} "
+            ok &= report(f"{suffix or 'f32':<5s} batch={batch} stride={stride:5d} "
                          f"({timing['per_launch_us']:8.2f} us, "
                          f"{flops / (timing['per_launch_us'] * 1e-6) / 1e9:7.1f} GFLOP/s)",
                          o, expected, atol=3e-3, rtol=3e-3)

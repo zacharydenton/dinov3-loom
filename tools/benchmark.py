@@ -52,7 +52,7 @@ def main() -> None:
 
     models = {}
     for dtype_name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
-        base = AutoModel.from_pretrained(str(R.SNAPSHOT), dtype=dtype).eval().cuda()
+        base = AutoModel.from_pretrained(str(R.snapshot()), dtype=dtype).eval().cuda()
         models[f"torch eager {dtype_name}"] = (base, dtype)
         for mode, label in (("default", "compile"), ("max-autotune", "max-autotune")):
             try:
