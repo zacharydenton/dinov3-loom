@@ -156,6 +156,12 @@ int main(int argc, char **argv) {
     // against ~120 slots and runs at 8.7% of peak; measured 1.54x there, and a
     // loss from batch 2 up, so it is gated on row count.
     int splitk_rows = 201;
+    // Fold RoPE into the QKV projection's epilogue above this row count. On
+    // the combined qkv+rope stage it measured 1.41x at batch 1, 1.31x at batch
+    // 2, 1.36x at batch 4, 1.22x at batch 8 and 1.09x at batch 32, so it is on
+    // everywhere. (A standalone harness said 0.64x at batch 1; the in-model
+    // measurement disagrees and is the one that counts.)
+    int qkv_rope_rows = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -177,6 +183,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-online-attn") online_attn = false;
         else if (a == "--f32-branch") f16_branch = false;
         else if (a == "--splitk-rows") splitk_rows = std::stoi(next());
+        else if (a == "--qkv-rope-rows") qkv_rope_rows = std::stoi(next());
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -214,7 +221,7 @@ int main(int argc, char **argv) {
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
     Kernel attn_online, wmma_o16_cf16, wmma_down16_cf16, residual_norm16, residual16;
-    Kernel splitk_down, splitk_reduce;
+    Kernel splitk_down, splitk_reduce, qkv_rope;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -253,6 +260,7 @@ int main(int argc, char **argv) {
     residual16.load(kernels_dir, "residual_f16branch", "dinov3_residual_scale_f32_f16branch");
     splitk_down.load(kernels_dir, "splitk_k1536_n384", "dinov3_matmul_splitk_f16_wmma");
     splitk_reduce.load(kernels_dir, "splitk_reduce_n384", "dinov3_splitk_reduce_f16");
+    qkv_rope.load(kernels_dir, "qkv_rope_k384_n1152", "dinov3_matmul_qkv_rope_f16_wmma");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -266,6 +274,7 @@ int main(int argc, char **argv) {
     const bool narrow_branch = narrow_act && f16_branch;
     const int SPLITS = 4;
     const bool use_splitk = narrow_branch && rows <= splitk_rows;
+    const bool use_qkv_rope = narrow_qkv && rows >= qkv_rope_rows;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
     const bool fused_swiglu = narrow_act && fuse_swiglu;
@@ -352,11 +361,20 @@ int main(int argc, char **argv) {
                 Stage stage("layernorm");
                 norm(x, W(p + "norm1_w"), W(p + "norm1_b"), h, narrow_act);
             }
+            if (use_qkv_rope) {
+                Stage stage("qkv matmul+rope");
+                KernArgs args;
+                args.scalar_i32(rows);
+                args.pointer(h); args.pointer(PW(p + "qkv_w")); args.pointer(W(p + "qkv_b"));
+                args.pointer(q); args.pointer(W("rope_cos")); args.pointer(W("rope_sin"));
+                launch(qkv_rope.function, QKV / TILE, (rows + TILE - 1) / TILE, args);
+            } else
             { Stage stage("qkv matmul");
               matmul(narrow_qkv ? wmma_qkv16_cf16
                                 : (narrow_act ? wmma_qkv16 : (wmma ? wmma_qkv : matmul_qkv)),
                      rows, QKV, h, PW(p + "qkv_w"), W(p + "qkv_b"), q); }
 
+            if (!use_qkv_rope)
             { Stage stage("rope");
             for (float *target : {q, k}) {
                 KernArgs args;

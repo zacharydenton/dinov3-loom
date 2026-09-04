@@ -826,3 +826,53 @@ worth a couple of percent end to end, **profile the stage it touches** rather
 than trying to resolve it in throughput. The stage measurement was clean and
 repeatable at 14.7%; the end-to-end measurement of the same change swung between
 0.995x and 1.114x depending on the protocol.
+
+## Lever 14: RoPE folded into the QKV epilogue -- shipped
+
+RoPE was two full read-modify-write passes over q and k per layer, 19.8 MB of
+traffic at batch 32 for no FLOPs. Lever 9 measured it at an apparent 333 GB/s --
+above what the memory can do, so it was being served from cache, having just
+been written by the QKV matmul. That made it look like a poor target. It is not:
+the traffic may be cached, but the pass still costs a launch and a round trip
+through the cache hierarchy, and folding it into the producer removes both.
+
+The rotation pairs channel `c` with `c+32` inside a 64-wide head. The n-tile is
+64 wide and head-aligned, so both partners are inside the workgroup -- but in
+*different waves*: `wave_n` 0 owns tile columns 0-31 and `wave_n` 1 owns 32-63,
+as subgroups 2m and 2m+1. They swap through the staging slots the epilogue
+already writes, which costs widening the two epilogue barriers from subgroup to
+workgroup scope. Occupancy is unchanged (64 VGPRs, 18432 B).
+
+Two things fall out of the layout. Each wave reads `cos`/`sin` at *its own*
+column: for a head-aligned 64-wide tile the channel inside the head is exactly
+`out_col_local`, so the low wave computes `low*cos - high*sin` and the high wave
+`high*cos + low*sin` from the same table entry. And the partner's bias sits 32
+columns away and has to be applied before the rotation mixes them.
+
+On the combined qkv+rope stage, best-of-N profiled:
+
+| batch | separate | fused | |
+| ---: | ---: | ---: | ---: |
+| 1 | 163.0 ms | 115.4 | **1.41x** |
+| 2 | 165.8 | 126.5 | 1.31x |
+| 4 | 131.1 | 96.2 | 1.36x |
+| 8 | 101.1 | 83.2 | 1.22x |
+| 32 | 165.9 | 152.3 | 1.09x |
+
+End to end **1.027x at batch 1 (599.7 -> 615.6) and 1.027x at batch 32
+(1392.2 -> 1429.9)**. Both batches agreeing on the same figure is what makes it
+credible at this size; a single batch reading 1.03x would not have been.
+Accuracy unchanged at cosine 0.99998.
+
+Two Loom notes. The partner wave index must be rebuilt as `2*wave_m + (1 -
+wave_n)` rather than `subgroup +/- 1`: the latter is the same value but its range
+does not follow from `wave_m`'s, so the staging read cannot prove in bounds. And
+a `buffer.view` with a *dynamic* base offset does not lower for `vector.load`
+(`source_memory.view_base`), so the partner slot is reached through one flat
+`view<128x16xf32>` over the whole staging area instead.
+
+A measurement warning: a standalone harness put this at **0.64x** at batch 1,
+against the in-model 1.41x. The standalone compared one fused launch against a
+matmul plus two rope launches timed separately at repeat=50, which amortises
+launch overhead differently from the real sequence. Where the two disagree, the
+in-model number is the one that counts.

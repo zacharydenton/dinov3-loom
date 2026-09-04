@@ -121,3 +121,11 @@ compile_exp matmul_splitk_f16_wmma dinov3_matmul_splitk_f16_wmma splitk_k1536_n3
   dinov3.matmul_splitk_f16_wmma.splits=4
 compile_exp splitk_reduce_f16 dinov3_splitk_reduce_f16 splitk_reduce_n384 \
   dinov3.splitk_reduce_f16.n_size=384 dinov3.splitk_reduce_f16.splits=4
+# QKV projection with RoPE folded into the epilogue, for batches large enough to
+# amortise the extra workgroup barriers it needs to swap channel pairs between
+# waves. Measured 1.10x over matmul+2x rope at batch 8 and 32, 0.64x at batch 1.
+compile_exp matmul_qkv_rope_f16_wmma dinov3_matmul_qkv_rope_f16_wmma qkv_rope_k384_n1152 \
+  dinov3.matmul_qkv_rope_f16_wmma.k_size=384 dinov3.matmul_qkv_rope_f16_wmma.n_size=1152 \
+  dinov3.matmul_qkv_rope_f16_wmma.head_dim=64 dinov3.matmul_qkv_rope_f16_wmma.prefix=5 \
+  dinov3.matmul_qkv_rope_f16_wmma.tokens_per_image=201 \
+  dinov3.matmul_qkv_rope_f16_wmma.rope_channels=768
