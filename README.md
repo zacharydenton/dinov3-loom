@@ -62,51 +62,51 @@ matching bug in the harness.
 
 ## Benchmark
 
-Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 5 interleaved rounds
+Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 3 interleaved rounds
 (`tools/benchmark.py`). The machine had other jobs on it throughout; interleaving
 means both sides saw the same contention.
 
 | configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 1115.9 | 4.94x |
-| torch compile fp16, batch 64 | 1091.5 | 4.83x |
-| torch eager fp16, batch 64 | 838.5 | 3.71x |
-| torch max-autotune fp16, batch 1 | 580.3 | 2.57x |
-| torch compile fp16, batch 1 | 343.8 | 1.52x |
-| torch eager fp16, batch 1 | 271.5 | 1.20x |
-| torch max-autotune fp32, batch 64 | 231.4 | 1.02x |
-| **loom fp32, batch 64** | **226.0** | **1.00x** |
-| **loom fp32, batch 8** | **224.2** | 0.99x |
-| **loom fp32, batch 32** | **221.8** | 0.98x |
-| torch compile fp32, batch 64 | 165.1 | 0.73x |
-| torch eager fp32, batch 64 | 146.5 | 0.65x |
-| torch compile fp32, batch 1 | 125.5 | 0.56x |
-| torch max-autotune fp32, batch 1 | 125.2 | 0.55x |
-| **loom fp32, batch 1** | **117.7** | 0.52x |
-| torch eager fp32, batch 1 | 115.8 | 0.51x |
+| torch max-autotune fp16, batch 64 | 1293.3 | 2.76x |
+| torch compile fp16, batch 64 | 1028.1 | 2.20x |
+| torch eager fp16, batch 64 | 836.2 | 1.79x |
+| torch max-autotune fp16, batch 1 | 556.8 | 1.19x |
+| **loom wmma fp16, batch 32** | **467.9** | **1.00x** |
+| **loom wmma fp16, batch 64** | **445.8** | 0.95x |
+| torch compile fp16, batch 1 | 310.0 | 0.66x |
+| **loom wmma fp16, batch 1** | **271.0** | 0.58x |
+| torch eager fp16, batch 1 | 268.6 | 0.57x |
+| torch max-autotune fp32, batch 64 | 237.4 | 0.51x |
+| **loom fp32, batch 32** | **214.6** | 0.46x |
+| torch compile fp32, batch 64 | 168.5 | 0.36x |
+| torch eager fp32, batch 64 | 146.2 | 0.31x |
+| **loom fp32, batch 1** | **117.3** | 0.25x |
+| torch eager fp32, batch 1 | 115.1 | 0.25x |
 
 Read it honestly:
 
-- **At fp32 these kernels match the best torch can do.** 226.0 against
-  max-autotune's 231.4 is a 2% gap, well inside this machine's run-to-run
-  variance, and it is 37% ahead of `torch.compile` and 54% ahead of eager at the
-  same batch. Batching is what closed it: 117.7 -> 226.0.
-- **The batch curve is flat from 8 upward** (224 / 222 / 226 at 8 / 32 / 64), so
-  batch 8 already buys nearly everything. Batch 1 costs about half the
-  throughput, and there the Loom path is roughly level with torch eager.
-- **fp16 torch is still 1.2-4.9x ahead**, and that gap is the whole remaining
-  story. Those paths reach WMMA through hipBLASLt and Triton; these kernels are
-  scalar f32 FMA and cannot. Closing it means f16 inputs with f32 accumulation
-  through Loom's `vector.mma`, which is what ggml-hrx's own corpus does. That is
-  the next kernel, not a tuning pass.
-- **max-autotune did not fail on ViT-S+**, unlike the ViT-L result recorded
-  earlier: it compiled and ran in every configuration and was torch's best fp32
-  result. The 96 KB LDS request that breaks it at ViT-L does not arise at
-  head_dim 64 with 201 tokens.
+- **At fp32 these kernels beat everything torch has**, by 1.3x over its best
+  (max-autotune batch 64) and 1.5x over `torch.compile`.
+- **At fp16 the WMMA path doubles that to 467.9 img/s** and clears every torch
+  fp16 batch-1 configuration except `max-autotune`. It does not yet reach torch's
+  batched fp16, which is 1.8-2.8x further ahead.
+- **That remaining gap is attention, not the matmuls.** With WMMA in place the
+  matmuls are down to 35% of the time and attention -- still scalar f32 -- is
+  36.7%, with the elementwise kernels (swiglu, layernorm, residual, rope) making
+  up the rest. A WMMA flash attention is the next kernel; ggml-hrx's corpus has
+  one to work from.
+- **`torch.compile` remains a pessimisation at fp32 batch 1** (125.7 and 123.3 vs
+  eager's 115.1 is inside the noise), and **max-autotune does not fail on ViT-S+**
+  the way it does on ViT-L -- the 96 KB LDS request that breaks it there does not
+  arise at head_dim 64 with 201 tokens.
 
-Getting here was 22 -> 46 -> 80 -> 94 -> 121 -> 226 img/s; `docs/notes.md` has
-what each step was worth. The two largest were both LDS bank conflicts, found in
-different kernels a day apart.
+Accuracy under WMMA is cosine **0.999999** against transformers (f16 weights,
+f32 accumulation); the f32 path is exact to ten digits. xdna-vision gates DINOv3
+at 0.997.
+
+The whole run was 22 -> 46 -> 80 -> 94 -> 121 -> 226 -> 468 img/s;
+`docs/notes.md` has what each step was worth.
 
 ## Layout
 

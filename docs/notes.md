@@ -138,3 +138,48 @@ and 211 vs 230 against it at batch 8 — with individual samples for one
 configuration ranging from 115 to 243. The difference is inside the noise floor
 of this machine, so the default keeps the single narrow-tile path and
 `--wide-threshold` is there to re-measure on an idle box.
+
+## WMMA, and what the corpus had to teach
+
+`vector.mma` plus `vector.fragment.load<lhs>/<rhs>` and
+`vector.fragment.store<result>` are Loom's WMMA surface -- the compiler owns the
+per-lane fragment layout, so it is about as much work as writing the same kernel
+with rocWMMA. Two things were not obvious:
+
+1. **The rhs fragment wants logical `[k][n]`.** Weights are stored `[n][k]`, so a
+   naive staging gives the transpose of what the fragment load expects. The fix
+   is a strided view over the same LDS bytes:
+   `encoding.layout.strided [1, %c40]` over a physically `[n][40]` tile reads as
+   logical `[k][n]`. The corpus does exactly this for its activation fragment.
+2. **The corpus WMMA kernels are wave64**, which is why their f32 accumulator is
+   `vector<4xf32>`. At `subgroup_size = 32` a 16x16 f32 fragment is
+   `vector<8xf32>`, and using the corpus's width gives
+   `matrix constraint 'wave_size' is not satisfied (source_bits=0, target_bits=256)`
+   -- 256 bits per lane being the tell.
+
+Activations stay f32 and are narrowed with `vector.fptrunc` while being staged
+into LDS, so only the weights changed dtype and no other kernel was touched.
+Accumulation is f32, matching what hipBLASLt does for torch's fp16 path.
+
+Result: 10-13 TFLOP/s on the model's shapes against ~2 TFLOP/s for the scalar f32
+kernel, and it beats the untuned rocWMMA reference in `experiments/` on the
+`down` shape (11.1 vs 6.5 TFLOP/s). End to end 1.8-2.3x, and 467.9 img/s at
+batch 32.
+
+Where the time goes now, at batch 32:
+
+```
+attention              36.7%   <- still scalar f32
+gate/up matmul         14.4%
+swiglu                 10.1%
+down matmul             9.4%
+residual+ls             7.4%
+layernorm               7.3%
+qkv matmul              5.9%
+o matmul                4.9%
+rope                    3.1%
+```
+
+The matmuls are no longer the problem. Attention is, and the elementwise kernels
+together are another 28% -- swiglu alone moves ~44 MB per image in f32, which an
+f16 handoff to the down projection would halve.
