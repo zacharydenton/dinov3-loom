@@ -1,0 +1,70 @@
+// Assemble the batched residual stream from the patch-embedding output.
+//
+//   x[i * tokens_per_image + t, :] = prefix[t, :]                        t < prefix_count
+//                                  = patches[i * patch_count + t - prefix_count, :]  otherwise
+//
+// The patch matmul produces one contiguous [batch * patches x hidden] block,
+// but the residual stream interleaves each image's CLS and register tokens in
+// front of its patches. One workgroup per output token does the placement.
+
+amdgpu.target<gfx11-generic> @dinov3_embed_scatter_gfx11_wave32 {subgroup_size = 32}
+
+config.decl @dinov3.embed_scatter_f32.hidden_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.embed_scatter_f32.tokens_per_image : %value: index where [range(%value, 1, 1024)]
+
+config.decl @dinov3.embed_scatter_f32.prefix : %value: index where [range(%value, 0, 64)]
+
+kernel.def target(@dinov3_embed_scatter_gfx11_wave32) export("dinov3_embed_scatter_f32") @dinov3_embed_scatter_f32(%token_count: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %patches: buffer, %prefix_weights: buffer, %x: buffer) {
+  %hidden_size0 = config.get @dinov3.embed_scatter_f32.hidden_size : index
+  %tokens_per_image0 = config.get @dinov3.embed_scatter_f32.tokens_per_image : index
+  %prefix0 = config.get @dinov3.embed_scatter_f32.prefix : index
+  %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 64, 8192), mul(%hidden_size0, 64)] : index
+  %tokens_per_image = index.assume %tokens_per_image0 [range(%tokens_per_image0, 1, 1024)] : index
+  %prefix = index.assume %prefix0 [range(%prefix0, 0, 64)] : index
+
+  %c0 = index.constant 0 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+
+  %token0 = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %valid = index.cmp ult, %token0, %token_count : index
+  %safe_token = scf.select %valid, %token0, %c0 : index
+  %token = index.assume %safe_token [lt(%safe_token, %token_count)] : index
+
+  %image = index.div %token, %tokens_per_image : index
+  %in_image = index.rem %token, %tokens_per_image : index
+  %patch_count = index.sub %tokens_per_image, %prefix : index
+
+  %patches_global = buffer.assume.memory_space<global> %patches : buffer
+  %prefix_global = buffer.assume.memory_space<global> %prefix_weights : buffer
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %patches_view = buffer.view %patches_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %prefix_view = buffer.view %prefix_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%token_count]x[%hidden_size]xf32>
+
+  %is_prefix = index.cmp ult, %in_image, %prefix : index
+  // Clamp before subtracting: an unsigned wrap here makes the address range
+  // unprovable and the AMDGPU backend rejects the load outright.
+  %clamped = scf.select %is_prefix, %prefix, %in_image : index
+  %patch_offset = index.sub %clamped, %prefix : index
+  %image_patch_base = index.mul %image, %patch_count : index
+  %patch_row0 = index.add %image_patch_base, %patch_offset : index
+  %source_row0 = scf.select %is_prefix, %in_image, %patch_row0 : index
+  %source_row = index.assume %source_row0 [range(%source_row0, 0, 65536), lt(%source_row0, %token_count)] : index
+
+  scf.if %valid {
+    scf.for %channel = [%workitem to %hidden_size step %c256] {
+      %from_prefix = view.load %prefix_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
+      %from_patches = view.load %patches_view[%source_row, %channel] : view<[%token_count]x[%hidden_size]xf32> -> f32
+      %value = scf.select %is_prefix, %from_prefix, %from_patches : f32
+      view.store %value, %x_view[%token, %channel] : f32, view<[%token_count]x[%hidden_size]xf32>
+    }
+  }
+  kernel.return
+}

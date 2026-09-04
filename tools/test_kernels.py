@@ -23,7 +23,8 @@ def main() -> int:
                        {"dinov3.rope_2d_f32.hidden_size": HID,
                         "dinov3.rope_2d_f32.head_dim": D,
                         "dinov3.rope_2d_f32.prefix": PREFIX,
-                        "dinov3.rope_2d_f32.row_stride": HID}, hsaco)
+                        "dinov3.rope_2d_f32.row_stride": HID,
+                        "dinov3.rope_2d_f32.tokens_per_image": T}, hsaco)
         x = rng.standard_normal((T, HID), dtype=np.float32)
         cos, sin = R.rope_tables()
         cos32, sin32 = cos.astype(np.float32), sin.astype(np.float32)
@@ -44,11 +45,12 @@ def main() -> int:
                        {"dinov3.attention_f32.hidden_size": HID,
                         "dinov3.attention_f32.head_dim": D,
                         "dinov3.attention_f32.scale": D ** -0.5,
-                        "dinov3.attention_f32.qkv_stride": HID}, hsaco)
+                        "dinov3.attention_f32.qkv_stride": HID,
+                        "dinov3.attention_f32.tokens_per_image": T}, hsaco)
         q = rng.standard_normal((T, HID), dtype=np.float32)
         k = rng.standard_normal((T, HID), dtype=np.float32)
         v = rng.standard_normal((T, HID), dtype=np.float32)
-        (o,), timing = launch(hsaco, "dinov3_attention_f32", (T, H, 1), (256, 1, 1),
+        (o,), timing = launch(hsaco, "dinov3_attention_f32", ((T + 7) // 8, H, 1), (256, 1, 1),
                               [("i32", T), ("in", q), ("in", k), ("in", v),
                                ("out", ((T, HID), np.float32))], tmp, repeat=100)
         qh = q.astype(np.float64).reshape(T, H, D).transpose(1, 0, 2)

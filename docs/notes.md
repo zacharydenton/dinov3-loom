@@ -98,3 +98,43 @@ kernel timings varied by 5x run to run, which made a tile-shape sweep almost
 useless. `tools/benchmark.py` interleaves the Loom and torch measurements and
 keeps the best of N rounds per configuration, so both sides see the same
 contention and the reported number is the least-disturbed sample.
+
+## Batching, and the second bank conflict
+
+Batching packs several images into one residual stream, which turns every matmul
+from M=201 into M=batch*201 and fixes the occupancy problem at the source. Three
+kernels had to learn about image boundaries first:
+
+* `rope_2d_f32` takes a `tokens_per_image` config and derives the RoPE position
+  from the offset inside the image, not inside the batch.
+* `attention_f32` takes the same config and restricts keys and values to the
+  query's own image.
+* `embed_scatter_f32` is new: the patch matmul emits one contiguous
+  `[batch*196 x 384]` block, but the residual stream interleaves each image's CLS
+  and register tokens in front of its patches, so a kernel places them.
+
+That alone took batch 4 to 178 img/s. Then attention became the top cost at 34%,
+for a specific reason: with one query per workgroup, every query re-read the
+entire K and V for its head from global memory — about 740 MB per image per
+forward pass at 201 tokens. Giving each workgroup a block of 8 queries and
+staging K/V through LDS in 32-key chunks cuts that eightfold, with one wave32
+subgroup per query so every softmax reduction is subgroup-local and needs no
+barrier.
+
+The rewrite was initially **4x slower** than the kernel it replaced. Same cause as
+the matmul: the K chunk was stored as `[32][64]`, so consecutive lanes read rows
+64 floats apart and collided in the same LDS bank on every score. Padding the row
+stride to 65 took it from 512 us back to 131 us — and now with an eighth of the
+memory traffic. Two independent kernels, the same mistake, a day apart.
+
+Final: **226 img/s at batch 64**, up from 117.7 at batch 1. The curve is flat from
+batch 8 (224) onward.
+
+## A tile choice that could not be settled
+
+Once the batch supplies workgroups, the 64x64 tile ought to beat 64x32 on the
+N=384 projections again. Best-of-3 said 243 vs 222 img/s for wide at batch 32,
+and 211 vs 230 against it at batch 8 — with individual samples for one
+configuration ranging from 115 to 243. The difference is inside the noise floor
+of this machine, so the default keeps the single narrow-tile path and
+`--wide-threshold` is there to re-measure on an idle box.

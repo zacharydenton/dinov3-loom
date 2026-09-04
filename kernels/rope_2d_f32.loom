@@ -15,6 +15,11 @@ config.decl @dinov3.rope_2d_f32.head_dim : %value: index where [range(%value, 16
 
 config.decl @dinov3.rope_2d_f32.prefix : %value: index where [range(%value, 0, 64)]
 
+// Tokens in one image. With a batched residual stream the workgroup index runs
+// over batch*tokens_per_image, and the RoPE position is the offset inside the
+// image, not inside the batch.
+config.decl @dinov3.rope_2d_f32.tokens_per_image : %value: index where [range(%value, 1, 1024)]
+
 // Row stride of the tensor being rotated. Equals hidden_size for a standalone
 // q or k, or the fused width when q/k/v share one matmul output.
 config.decl @dinov3.rope_2d_f32.row_stride : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
@@ -32,6 +37,8 @@ kernel.def target(@dinov3_rope_gfx11_wave32) export("dinov3_rope_2d_f32") @dinov
   %prefix = index.assume %prefix0 [range(%prefix0, 0, 64)] : index
   %row_stride0 = config.get @dinov3.rope_2d_f32.row_stride : index
   %row_stride = index.assume %row_stride0 [range(%row_stride0, 64, 32768), mul(%row_stride0, 64)] : index
+  %tokens_per_image0 = config.get @dinov3.rope_2d_f32.tokens_per_image : index
+  %tokens_per_image = index.assume %tokens_per_image0 [range(%tokens_per_image0, 1, 1024)] : index
 
   %c0 = index.constant 0 : index
   %c2 = index.constant 2 : index
@@ -45,10 +52,11 @@ kernel.def target(@dinov3_rope_gfx11_wave32) export("dinov3_rope_2d_f32") @dinov
   %in_bounds = index.cmp ult, %token0, %token_count : index
   %safe_token = scf.select %in_bounds, %token0, %c0 : index
   %token = index.assume %safe_token [lt(%safe_token, %token_count)] : index
-  %past_prefix = index.cmp uge, %token, %prefix : index
+  %in_image = index.rem %token, %tokens_per_image : index
+  %past_prefix = index.cmp uge, %in_image, %prefix : index
   %rotates = scalar.andi %in_bounds, %past_prefix : i1
   scf.if %rotates {
-    %position0 = index.sub %token, %prefix : index
+    %position0 = index.sub %in_image, %prefix : index
     %position = index.assume %position0 [lt(%position0, %token_count)] : index
     %x_global = buffer.assume.memory_space<global> %x : buffer
     %cos_global = buffer.assume.memory_space<global> %cos : buffer

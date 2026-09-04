@@ -22,10 +22,11 @@ ROOT = Path(__file__).resolve().parent.parent
 ROUNDS = 5
 
 
-def loom_throughput(images: int = 30) -> float:
+def loom_throughput(batch: int = 1, images: int = 320) -> float:
     result = subprocess.run(
         [str(ROOT / "host/dinov3"), "--input", str(ROOT / "build/patchified.bin"),
-         "--repeat", str(images)], check=True, capture_output=True, text=True, cwd=ROOT)
+         "--batch", str(batch), "--repeat", str(max(4, images // batch))],
+        check=True, capture_output=True, text=True, cwd=ROOT)
     return json.loads(result.stdout.strip().splitlines()[-1])["img_per_s"]
 
 
@@ -68,19 +69,20 @@ def main() -> None:
 
     best: dict[str, float] = {}
     for round_index in range(ROUNDS):
-        best["loom fp32 (batch 1)"] = max(best.get("loom fp32 (batch 1)", 0.0),
-                                          loom_throughput())
+        for loom_batch in (1, 8, 32, 64):
+            key = f"loom fp32 (batch {loom_batch})"
+            best[key] = max(best.get(key, 0.0), loom_throughput(loom_batch))
         for name, (model, dtype) in models.items():
             for batch in (1, 64):
                 key = f"{name} (batch {batch})"
                 best[key] = max(best.get(key, 0.0), torch_throughput(model, batch, dtype))
         print(f"  round {round_index + 1}/{ROUNDS} done", flush=True)
 
-    print(f"\n{'configuration':<32s} {'img/s':>9s}   vs Loom")
-    baseline = best["loom fp32 (batch 1)"]
+    print(f"\n{'configuration':<34s} {'img/s':>9s}   vs best Loom")
+    baseline = max(v for k, v in best.items() if k.startswith("loom"))
     for name, value in sorted(best.items(), key=lambda kv: -kv[1]):
         marker = "  <-- this repo" if name.startswith("loom") else ""
-        print(f"{name:<32s} {value:9.1f}   {value / baseline:5.2f}x{marker}")
+        print(f"{name:<34s} {value:9.1f}   {value / baseline:5.2f}x{marker}")
 
 
 if __name__ == "__main__":

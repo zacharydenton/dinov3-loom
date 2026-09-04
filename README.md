@@ -63,44 +63,50 @@ matching bug in the harness.
 ## Benchmark
 
 Radeon 8060S (gfx1151), torch 2.13.0 + ROCm, best of 5 interleaved rounds
-(`tools/benchmark.py`). The machine had other jobs on it; interleaving means
-both sides saw the same contention.
+(`tools/benchmark.py`). The machine had other jobs on it throughout; interleaving
+means both sides saw the same contention.
 
-| configuration | img/s | vs Loom |
+| configuration | img/s | vs best Loom |
 | --- | ---: | ---: |
-| torch max-autotune fp16, batch 64 | 857.9 | 7.07x |
-| torch compile fp16, batch 64 | 712.3 | 5.87x |
-| torch eager fp16, batch 64 | 513.9 | 4.23x |
-| torch max-autotune fp16, batch 1 | 473.7 | 3.90x |
-| torch compile fp16, batch 1 | 247.6 | 2.04x |
-| torch eager fp16, batch 1 | 178.7 | 1.47x |
-| torch max-autotune fp32, batch 64 | 159.7 | 1.32x |
-| torch compile fp32, batch 64 | 136.8 | 1.13x |
-| **loom fp32, batch 1** | **121.4** | **1.00x** |
-| torch eager fp32, batch 1 | 115.3 | 0.95x |
-| torch eager fp32, batch 64 | 114.4 | 0.94x |
-| torch max-autotune fp32, batch 1 | 82.0 | 0.68x |
-| torch compile fp32, batch 1 | 75.5 | 0.62x |
+| torch max-autotune fp16, batch 64 | 1115.9 | 4.94x |
+| torch compile fp16, batch 64 | 1091.5 | 4.83x |
+| torch eager fp16, batch 64 | 838.5 | 3.71x |
+| torch max-autotune fp16, batch 1 | 580.3 | 2.57x |
+| torch compile fp16, batch 1 | 343.8 | 1.52x |
+| torch eager fp16, batch 1 | 271.5 | 1.20x |
+| torch max-autotune fp32, batch 64 | 231.4 | 1.02x |
+| **loom fp32, batch 64** | **226.0** | **1.00x** |
+| **loom fp32, batch 8** | **224.2** | 0.99x |
+| **loom fp32, batch 32** | **221.8** | 0.98x |
+| torch compile fp32, batch 64 | 165.1 | 0.73x |
+| torch eager fp32, batch 64 | 146.5 | 0.65x |
+| torch compile fp32, batch 1 | 125.5 | 0.56x |
+| torch max-autotune fp32, batch 1 | 125.2 | 0.55x |
+| **loom fp32, batch 1** | **117.7** | 0.52x |
+| torch eager fp32, batch 1 | 115.8 | 0.51x |
 
 Read it honestly:
 
-- **At fp32 batch 1 the Loom path wins**, beating every torch fp32 batch-1
-  configuration including `max-autotune`, and it beats torch fp32 at batch 64
-  while itself running one image at a time.
-- **fp16 torch is 4-7x ahead**, and that gap is the whole remaining story. Those
-  paths reach WMMA through hipBLASLt and Triton; these kernels are scalar f32
-  FMA and cannot. Closing it means f16 inputs with f32 accumulation through
-  Loom's `vector.mma`, which is what ggml-hrx's own corpus does. That is the
-  next kernel, not a tuning pass.
-- **`torch.compile` is a pessimisation at fp32 batch 1** here (75.5 and 82.0 vs
-  eager's 115.3). Only batching pays it back.
+- **At fp32 these kernels match the best torch can do.** 226.0 against
+  max-autotune's 231.4 is a 2% gap, well inside this machine's run-to-run
+  variance, and it is 37% ahead of `torch.compile` and 54% ahead of eager at the
+  same batch. Batching is what closed it: 117.7 -> 226.0.
+- **The batch curve is flat from 8 upward** (224 / 222 / 226 at 8 / 32 / 64), so
+  batch 8 already buys nearly everything. Batch 1 costs about half the
+  throughput, and there the Loom path is roughly level with torch eager.
+- **fp16 torch is still 1.2-4.9x ahead**, and that gap is the whole remaining
+  story. Those paths reach WMMA through hipBLASLt and Triton; these kernels are
+  scalar f32 FMA and cannot. Closing it means f16 inputs with f32 accumulation
+  through Loom's `vector.mma`, which is what ggml-hrx's own corpus does. That is
+  the next kernel, not a tuning pass.
 - **max-autotune did not fail on ViT-S+**, unlike the ViT-L result recorded
-  earlier: it compiled and ran in every configuration. The 96 KB LDS request
-  that breaks it at ViT-L does not arise at head_dim 64 with 201 tokens.
+  earlier: it compiled and ran in every configuration and was torch's best fp32
+  result. The 96 KB LDS request that breaks it at ViT-L does not arise at
+  head_dim 64 with 201 tokens.
 
-Getting from the first working version to here was 22 -> 46 -> 80 -> 94 -> 121
-img/s; `docs/notes.md` has what each step was worth. The single largest change
-was padding an LDS row stride from 32 to 33 floats.
+Getting here was 22 -> 46 -> 80 -> 94 -> 121 -> 226 img/s; `docs/notes.md` has
+what each step was worth. The two largest were both LDS bank conflicts, found in
+different kernels a day apart.
 
 ## Layout
 
