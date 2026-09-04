@@ -433,7 +433,53 @@ their revision failed too: it does not configure under CMake at all
 (`iree_package_ns(): Could not determine package for experimental/id4/ideogram4`)
 because `hrx-demos` builds with Bazel.
 
-So the next step is not more kernel work. It is either:
+### What the constraint actually checks
+
+`loom/src/loom/target/arch/amdgpu/lower/matrix_fragment_memory_plan.c:1352` rejects
+when, for any dynamic address term:
+
+```c
+term->byte_stride < 0 || term->byte_stride > UINT32_MAX ||
+!loom_low_source_memory_dynamic_term_fits_unsigned_bit_count(term, 32)
+```
+
+and that predicate is `loom_value_facts_fit_unsigned_bit_count(term->byte_facts, 32)`.
+So the name is misleading: it is not "the stride is dynamic", it is **the term's
+byte-offset facts must be provably within 32 bits**. That should be easy to
+satisfy, which is why the rest of this is puzzling.
+
+### Eliminated
+
+A minimal reproducer (`33 lines`, wave32, dense `view<[capacity]x[1152]xf16>`,
+workgroup-derived row and channel with literal `range` facts, `lhs` and `rhs`
+fragment loads inside a loop) **compiles**. Adding a transposed
+`encoding.layout.strided [1, stride]` view for the `rhs`: still compiles. Nesting
+that loop inside an outer loop carrying the accumulator fragment: still compiles.
+
+None of the following makes the real kernel compile:
+
+* bounding `%token_count` with `range(...)`
+* literal `range` facts on every address term instead of `le(...)`
+* shrinking `token_capacity` from 262144 to 4096, so every byte range is tiny
+* raw `config.get` values instead of `index.assume`d ones in the view types
+* dense views for q and v with the head channel indexed directly
+* a compile-time-constant view extent
+* `mul(..., 16)` alignment facts on the channel and on both tile origins
+* removing `unroll` from the QK loop
+* targeting `gfx1100`, as hrx-demos does
+* moving the image onto a third grid axis so no index comes from a division
+* `tokens_per_image = 208` so every tile origin really is 16-aligned
+
+So the feature works on this revision and the reproducer proves it; something
+structural in the full kernel defeats the fact analysis and it is not any of the
+dozen things above.
+
+### Next
+
+The remaining approach is to bisect the *real* kernel downward rather than the
+reproducer upward -- delete the P*V half, then the softmax, then the online
+bookkeeping, until it compiles -- which is mechanical but wants a batch of
+compiles. Failing that:
 
 1. build the July revision through Bazel (`python dev.py setup --release` in
    `hrx-demos`, which vendors its own hrx-system) and compile the ported kernel
