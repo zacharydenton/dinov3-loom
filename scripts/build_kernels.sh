@@ -112,3 +112,12 @@ for kn in 384:384 1536:384; do
   compile matmul_bias_f16_wmma_af16_cf16 dinov3_matmul_bias_f16_wmma_af16_cf16 "wmma_af16_cf16_k${k}_n${n}" \
     "dinov3.matmul_bias_f16_wmma_af16_cf16.k_size=$k" "dinov3.matmul_bias_f16_wmma_af16_cf16.n_size=$n"
 done
+# Split-K down projection, for small batches only. At batch 1 the 64x64 tile
+# launches 24 workgroups against ~120 slots; splitting k four ways fills the
+# machine without losing the tile's arithmetic intensity.
+compile_exp() { local src="experiments/$1.loom"; shift; local root="$1" stem="$2"; shift 2; local args=(); for c in "$@"; do args+=("--config=$c"); done; "$LOOM_COMPILE" "$src" --backend=amdgpu-hal --target="$LOOM_TARGET" --root="@$root" "${args[@]}" --output="$out/$stem.hsaco"; printf "  %-22s %s\n" "$stem" "$(stat -c%s "$out/$stem.hsaco") bytes"; }
+compile_exp matmul_splitk_f16_wmma dinov3_matmul_splitk_f16_wmma splitk_k1536_n384 \
+  dinov3.matmul_splitk_f16_wmma.k_size=1536 dinov3.matmul_splitk_f16_wmma.n_size=384 \
+  dinov3.matmul_splitk_f16_wmma.splits=4
+compile_exp splitk_reduce_f16 dinov3_splitk_reduce_f16 splitk_reduce_n384 \
+  dinov3.splitk_reduce_f16.n_size=384 dinov3.splitk_reduce_f16.splits=4

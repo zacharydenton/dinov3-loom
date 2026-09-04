@@ -658,3 +658,48 @@ The other three all tried to make a compute- or latency-bound kernel faster by
 restructuring it, and all three lost. The one that worked removed bytes from a
 stage that the numbers said was bandwidth-bound. Worth remembering as the order
 to try things in.
+
+## Lever 10: split-K for the down projection at batch 1 -- shipped
+
+At batch 1 the matmuls do not fill the machine. With a 64x64 tile and m=201:
+
+| stage | workgroups | of ~120 slots | TFLOP/s | % of peak |
+| --- | ---: | ---: | ---: | ---: |
+| qkv | 72 | 60% | 7.7 | 14.6% |
+| o | 24 | 20% | 3.3 | 6.2% |
+| down | 24 | 20% | 4.6 | 8.7% |
+
+Weights are 97% of the traffic at batch 1 (4.72 MB per layer against 0.154 MB of
+activations), which suggests fp8 weights -- but the achieved bandwidth is only
+~24 GB/s, **9% of peak**, so batch 1 is not bandwidth-bound and halving the
+weights would not have helped. It is starved of workgroups.
+
+Two ways to add workgroups. A narrower tile
+(`experiments/matmul_bias_f16_wmma_narrow.loom`, 64x32, one accumulator per
+wave) doubles them and **loses**: 0.70x on down at batch 1, 0.68-0.93x
+elsewhere, because halving the output per workgroup halves arithmetic intensity
+and that costs more than the parallelism gains.
+
+Splitting the k range keeps the 64x64 tile's intensity and multiplies the
+workgroup count instead. `experiments/matmul_splitk_f16_wmma.loom` puts the k
+chunk on a third grid axis, each workgroup accumulating into its own slab of an
+f32 partials buffer; `splitk_reduce_f16` sums the slabs, adds the bias and
+narrows to f16. Down at batch 1, splits=4: **18.1 us + 2.9 us against 32.4 us**,
+96 workgroups instead of 24, stable across runs where the baseline drifts
+32-49 us on a contended box.
+
+It is a batch-1 optimisation only -- 0.80x at batch 4, 0.48x at batch 32 -- so
+it is gated at `rows <= splitk_rows` (default 201, i.e. batch 1; `--splitk-rows`
+overrides). Batch 2 measured 0.986x end to end, inside the noise but not a win,
+so the gate excludes it.
+
+End to end at batch 1, repeat=800, best-of-7 interleaved: **531.0 -> 625.9
+img/s, 1.179x** (an earlier best-of-5 at repeat=300 gave 552.7 -> 632.3,
+1.144x). That clears torch max-autotune's 594.3 at batch 1, the one
+configuration this repo had never won. Accuracy unchanged at cosine 0.99998.
+
+A note on measurement: in one round batch 32 read 1.099x between two configs
+that differ only by a flag that is *gated off* at that batch -- i.e. identical
+work. The noise floor on this box, with a 10-core CPU job resident, is about
++/-10% on end-to-end throughput at low repeat counts. Anything under ~1.15x
+needs repeat=800 and best-of-7 before it means anything.

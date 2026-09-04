@@ -1,0 +1,66 @@
+// Sums the split-K partial slabs, adds the bias and narrows to f16.
+//
+// The partials are [splits][token_count][n_size] f32; the output is
+// [token_count][n_size] f16, matching what the af16_cf16 matmul would have
+// written. One workgroup per token row, 256 workitems striding the columns
+// four at a time.
+
+amdgpu.target<gfx11-generic> @dinov3_splitk_reduce_gfx11 {subgroup_size = 32}
+
+config.decl @dinov3.splitk_reduce_f16.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+config.decl @dinov3.splitk_reduce_f16.splits : %value: index where [range(%value, 1, 16)]
+
+kernel.def target(@dinov3_splitk_reduce_gfx11) export("dinov3_splitk_reduce_f16") @dinov3_splitk_reduce_f16(%token_count: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %partials: buffer, %bias: buffer, %out: buffer) {
+  %n_size = config.get @dinov3.splitk_reduce_f16.n_size : index
+  %splits = config.get @dinov3.splitk_reduce_f16.splits : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  %c1024 = index.constant 1024 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = vector.constant 0.0 : vector<4xf32>
+
+  %workitem = kernel.workitem.id<x> : index
+  %lane_column = index.mul %workitem, %c4 : index
+
+  %token_bounded = index.assume %token_count [range(%token_count, 1, 4194304)] : index
+  %token_raw = kernel.workgroup.id<x> : index
+  %token_valid = index.cmp ult, %token_raw, %token_bounded : index
+  %partials_global = buffer.assume.memory_space<global> %partials : buffer
+  %bias_global = buffer.assume.memory_space<global> %bias : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %partial_rows = index.mul %splits, %token_bounded : index
+  %partials_view = buffer.view %partials_global[%c0_offset] : buffer -> view<[%partial_rows]x[%n_size]xf32>
+  %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_bounded]x[%n_size]xf16>
+
+  // The loop starts on a multiple of 4 and n_size is a multiple of 64, so a
+  // vector4 never straddles the end -- but the induction variable's bound is
+  // not visible to the subrange analysis without saying so.
+  %column_limit = index.sub %n_size, %c4 : index
+  scf.if %token_valid {
+  %token = index.assume %token_raw [lt(%token_raw, %token_bounded)] : index
+  scf.for %column0 = [%lane_column to %n_size step %c1024] {
+    %column = index.assume %column0 [le(%column0, %column_limit)] : index
+    %total = scf.for %split = [%c0 to %splits step %c1](%running = %zero : vector<4xf32>) -> (vector<4xf32>) {
+      %slab = index.mul %split, %token_bounded : index
+      %row0 = index.add %slab, %token : index
+      %row = index.assume %row0 [lt(%row0, %partial_rows)] : index
+      %values = vector.load %partials_view[%row, %column] : view<[%partial_rows]x[%n_size]xf32> -> vector<4xf32>
+      %next = vector.addf %running, %values : vector<4xf32>
+      scf.yield %next : vector<4xf32>
+    }
+    %bias_values = vector.load %bias_view[%column] : view<[%n_size]xf32> -> vector<4xf32>
+    %biased = vector.addf %total, %bias_values : vector<4xf32>
+    %narrow = vector.fptrunc %biased : vector<4xf32> to vector<4xf16>
+    vector.store %narrow, %out_view[%token, %column] : vector<4xf16>, view<[%token_bounded]x[%n_size]xf16>
+  }
+  }
+  kernel.return
+}

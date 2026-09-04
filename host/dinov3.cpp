@@ -151,6 +151,11 @@ int main(int argc, char **argv) {
     // exactly once, by residual+norm. Carrying them f32 doubles their traffic
     // for no precision that survives the residual add.
     bool f16_branch = true;
+    // Split the down projection's k range four ways when the batch is too small
+    // to fill the machine. At batch 1 it otherwise launches 24 workgroups
+    // against ~120 slots and runs at 8.7% of peak; measured 1.54x there, and a
+    // loss from batch 2 up, so it is gated on row count.
+    int splitk_rows = 201;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -171,6 +176,7 @@ int main(int argc, char **argv) {
         else if (a == "--attn-tile") attn_tile = std::stoi(next());
         else if (a == "--no-online-attn") online_attn = false;
         else if (a == "--f32-branch") f16_branch = false;
+        else if (a == "--splitk-rows") splitk_rows = std::stoi(next());
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 64; }
     }
 
@@ -208,6 +214,7 @@ int main(int argc, char **argv) {
     Kernel layernorm16, swiglu16, flash16, wmma_qkv16, wmma_o16, wmma_gateup16, wmma_down16;
     Kernel rope16, flash16_af16, wmma_qkv16_cf16, residual_norm, wmma_swiglu;
     Kernel attn_online, wmma_o16_cf16, wmma_down16_cf16, residual_norm16, residual16;
+    Kernel splitk_down, splitk_reduce;
     layernorm.load(kernels_dir, "layernorm", "dinov3_layernorm_f32");
     rope.load(kernels_dir, "rope", "dinov3_rope_2d_f32");
     attention.load(kernels_dir, "attention", "dinov3_attention_f32");
@@ -244,6 +251,8 @@ int main(int argc, char **argv) {
     wmma_down16_cf16.load(kernels_dir, "wmma_af16_cf16_k1536_n384", "dinov3_matmul_bias_f16_wmma_af16_cf16");
     residual_norm16.load(kernels_dir, "residual_layernorm_f16branch", "dinov3_residual_layernorm_f32_f16branch");
     residual16.load(kernels_dir, "residual_f16branch", "dinov3_residual_scale_f32_f16branch");
+    splitk_down.load(kernels_dir, "splitk_k1536_n384", "dinov3_matmul_splitk_f16_wmma");
+    splitk_reduce.load(kernels_dir, "splitk_reduce_n384", "dinov3_splitk_reduce_f16");
 
     const int rows = batch * TOKENS;          // residual-stream rows
     const int patch_rows = batch * PATCHES;
@@ -255,6 +264,8 @@ int main(int argc, char **argv) {
     // q/k/v carried as f16 through rope and attention as well.
     const bool narrow_qkv = narrow_act && f16_qkv;
     const bool narrow_branch = narrow_act && f16_branch;
+    const int SPLITS = 4;
+    const bool use_splitk = narrow_branch && rows <= splitk_rows;
     // The fused kernel writes f16, so it needs the narrow activation path.
     const bool fused_norm = narrow_act && fuse_norm;
     const bool fused_swiglu = narrow_act && fuse_swiglu;
@@ -271,6 +282,8 @@ int main(int argc, char **argv) {
     alloc(&gate, size_t(rows) * GATEUP);
     alloc(&act, size_t(rows) * INTERMEDIATE);  alloc(&out, size_t(rows) * HIDDEN);
     alloc(&patched, size_t(patch_rows) * HIDDEN);
+    float *partials = nullptr;
+    if (use_splitk) alloc(&partials, size_t(SPLITS) * rows * HIDDEN);
     // q/k/v are f16 under narrow_act, so the head offsets are half as many
     // float-sized steps.
     const int qkv_step = (wmma && f16_act && f16_qkv) ? HIDDEN / 2 : HIDDEN;
@@ -402,6 +415,23 @@ int main(int argc, char **argv) {
                     launch(narrow_act ? swiglu16.function : swiglu.function, rows, 1, args);
                 }
             }
+            if (use_splitk) {
+                Stage stage("down matmul");
+                KernArgs args;
+                args.scalar_i32(rows);
+                args.pointer(act); args.pointer(PW(p + "down_w"));
+                args.pointer(W(p + "down_b")); args.pointer(partials);
+                void *cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes,
+                                HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size,
+                                HIP_LAUNCH_PARAM_END };
+                HIP_CHECK(hipModuleLaunchKernel(splitk_down.function, HIDDEN / TILE,
+                                                (rows + TILE - 1) / TILE, SPLITS,
+                                                THREADS, 1, 1, 0, nullptr, nullptr, cfg));
+                KernArgs red;
+                red.scalar_i32(rows);
+                red.pointer(partials); red.pointer(W(p + "down_b")); red.pointer(mlp);
+                launch(splitk_reduce.function, rows, 1, red);
+            } else
             { Stage stage("down matmul");
               matmul(narrow_branch ? wmma_down16_cf16
                                    : (narrow_act ? wmma_down16 : (wmma ? wmma_down : down_kernel)),
